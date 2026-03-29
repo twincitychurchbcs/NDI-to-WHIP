@@ -233,29 +233,19 @@ def build_pipeline_string(cfg: Config) -> str:
     """
     Build the GStreamer pipeline string.
 
-    Pipeline topology:
-      ndisrc → ndisrcdemux ─┬─ [video path] → rtph264pay → whipclientsink
-                          └─ [audio path] → rtpopuspay ↗
+    Pipeline topology (gst-plugins-rs >= 1.24):
+      ndisrc → ndisrcdemux ─┬─ [video: raw] → whipclientsink
+                            └─ [audio: raw] ↗
+
+    whipclientsink (GstBaseWebRTCSink) handles codec negotiation and
+    encoding internally. Feed raw video/audio — pre-encoded input is
+    not supported by the BaseWebRTCSink codec discovery mechanism.
 
     ndisrc / ndisrcdemux notes:
-      The gst-plugins-rs NDI plugin (video/ndi/) outputs a raw NDI buffer
-      via ndisrc; ndisrcdemux splits it into separate video/audio src pads.
-      Pad names vary by plugin version — see --probe-pads flag.
+      The gst-plugins-rs NDI plugin outputs a raw NDI buffer via ndisrc;
+      ndisrcdemux splits it into separate video/audio src pads.
+      Run:  gst-inspect-1.0 ndisrcdemux  to see actual pad template names.
     """
-    enc_profile = ENCODER_PROFILES.get(cfg.video_encoder)
-    if enc_profile is None:
-        raise ValueError(
-            f"Unknown video_encoder '{cfg.video_encoder}'. "
-            f"Valid: {list(ENCODER_PROFILES)}"
-        )
-
-    encoder_str = enc_profile["encoder"].format(
-        bitrate=cfg.video_bitrate_kbps,
-        keyframe_interval=cfg.keyframe_interval,
-    )
-    encoder_caps = enc_profile["caps"]
-    rtp_pay_str  = enc_profile["pay"]
-
     video_caps = (
         f"video/x-raw,format=I420"
         f",width={cfg.video_width}"
@@ -278,18 +268,6 @@ def build_pipeline_string(cfg: Config) -> str:
     stun_prop = f'stun-server="{cfg.stun_server}"' if cfg.stun_server else ""
     turn_prop = f'turn-server="{cfg.turn_server}"' if cfg.turn_server else ""
 
-    # ─── Pipeline string ────────────────────────────────────────────────────
-    #
-    # IMPORTANT: If your NDI plugin version exposes separate pads with different
-    # names (e.g. video_0 / audio_0, or just unnamed request pads), adjust the
-    # "demux.video" / "demux.audio" references below.
-    # Run:  gst-inspect-1.0 ndisrcdemux  to see actual pad template names.
-    #
-    # Alternative for plugins with ndivideosrc / ndiaudiosrc:
-    #   Replace the ndisrc+ndisrcdemux block with:
-    #     ndivideosrc ndi-name="..." ! ...
-    #     ndiaudiosrc ndi-name="..." ! ...
-    #
     pipeline = f"""
         whipclientsink name=whip
             signaller::whip-endpoint="{cfg.whip_url}"
@@ -314,8 +292,6 @@ def build_pipeline_string(cfg: Config) -> str:
         ! videoscale
         ! videorate
         ! {video_caps}
-        ! {encoder_str}
-        ! {encoder_caps}
         ! whip.
 
         demux.audio
@@ -327,11 +303,6 @@ def build_pipeline_string(cfg: Config) -> str:
         ! audioconvert
         ! audioresample
         ! {audio_caps}
-        ! opusenc name=aenc
-            bitrate={cfg.audio_bitrate_bps}
-            audio-type=restricted-lowdelay
-            bandwidth=fullband
-            frame-size=10
         ! whip.
     """
 
