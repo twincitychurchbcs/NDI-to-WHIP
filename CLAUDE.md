@@ -47,9 +47,9 @@ All logic lives in `ndi_to_whip.py`. There are no other Python modules.
 
 **`Config` dataclass** — all tunable parameters with defaults. `load_config()` merges a TOML file first, then CLI `--overrides` win. TOML sections map to config fields: `[ndi]`, `[whip]`, `[video]`, `[audio]`, `[retry]`, `[logging]`.
 
-**`ENCODER_PROFILES` dict** — maps encoder name (`x264`, `vaapi`, `nvenc`) to a tuple of the GStreamer encoder element string, caps filter string, and RTP payloader string. Adding a new encoder means adding an entry here and nowhere else.
+**`ENCODER_PROFILES` dict** — maps encoder name (`x264`, `vaapi`, `nvenc`) to a tuple of the GStreamer encoder element string, caps filter string, and RTP payloader string. Note: in gst-plugins-rs ≥ 1.24, `GstBaseWebRTCSink` handles encoding internally — `ENCODER_PROFILES` is retained for reference but the pipeline feeds raw A/V to `whipclientsink`.
 
-**`build_pipeline_string(cfg)`** — assembles the full GStreamer `parse_launch` string. The pipeline has two branches from `ndisrcdemux` (video and audio) that both terminate at the same named `whipclientsink` element. If `ndisrcdemux` pad names differ in a given plugin version, this is the only function to change.
+**`build_pipeline_string(cfg)`** — assembles the full GStreamer `parse_launch` string. The pipeline feeds raw video/audio to `whipclientsink` (which is `GstBaseWebRTCSink` / `GstWhipWebRTCSink` in 1.24.x). `video-caps="video/x-h264"` forces H.264 selection. The pipeline has two branches from `ndisrcdemux` (video and audio) that both terminate at the same named `whipclientsink` element. The WHIP URL is set via `signaller::whip-endpoint` (GstChildProxy child property).
 
 **`NdiToWhipBridge`** — manages the GStreamer lifecycle:
 - `_create_pipeline()` calls `Gst.parse_launch()` and raises with a human-readable hint on failure

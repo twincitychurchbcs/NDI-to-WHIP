@@ -274,6 +274,7 @@ def build_pipeline_string(cfg: Config) -> str:
             {auth_prop}
             {stun_prop}
             {turn_prop}
+            video-caps="video/x-h264"
             async-handling=true
 
         ndisrc name=ndi_src

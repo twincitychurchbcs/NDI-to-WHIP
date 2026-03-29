@@ -3,8 +3,9 @@
 Production-grade Ubuntu service that captures a named NDI source and publishes it
 to a WHIP (WebRTC HTTP Ingest Protocol) endpoint as H.264 + Opus over WebRTC.
 
-Built on GStreamer with `whipclientsink` (from `gst-plugins-rs`) and the NDI plugin
-from the same Rust workspace. Single pipeline, no intermediate hops, low latency.
+Built on GStreamer with `whipclientsink` from `gst-plugins-rs` (Rust). Single
+pipeline, no intermediate hops, low latency. Tested on Ubuntu 24.04 with
+GStreamer 1.24 and gst-plugins-rs `gstreamer-1.24.13`.
 
 ---
 
@@ -18,10 +19,12 @@ from the same Rust workspace. Single pipeline, no intermediate hops, low latency
   - [3. NDI SDK (manual)](#3-ndi-sdk-manual)
   - [4. Build GStreamer plugins](#4-build-gstreamer-plugins)
   - [5. Application setup](#5-application-setup)
+- [MediaMTX — local WHIP server](#mediamtx--local-whip-server)
 - [Configuration](#configuration)
 - [Running](#running)
   - [Manual / foreground](#manual--foreground)
   - [As a systemd service](#as-a-systemd-service)
+- [Viewing the stream](#viewing-the-stream)
 - [Testing and Validation](#testing-and-validation)
 - [Troubleshooting](#troubleshooting)
 - [Hardware Encoding](#hardware-encoding)
@@ -35,27 +38,30 @@ from the same Rust workspace. Single pipeline, no intermediate hops, low latency
 NDI network
     │
     ▼
-ndisrc  ──►  ndidemux
-                │
-                ├── video ──► videoconvert ► videoscale ► videorate
-                │             ► x264enc (zerolatency, CBR)
-                │             ► rtph264pay
-                │                              ┐
-                └── audio ──► audioconvert      ├──► whipclientsink
-                              ► audioresample   │    (WHIP HTTP POST)
-                              ► opusenc         │    (ICE + DTLS-SRTP)
-                              ► rtpopuspay      ┘
-                                                │
-                                        WHIP ingest endpoint
+ndisrc ──► ndisrcdemux
+               │
+               ├── video (raw) ──► videoconvert ► videoscale ► videorate
+               │                   video/x-raw,I420,1920x1080,30fps
+               │                                               ┐
+               └── audio (raw) ──► audioconvert ► audioresample├──► whipclientsink
+                                   audio/x-raw,S16LE,48kHz,2ch ┘    (GstBaseWebRTCSink)
+                                                                      │
+                                                               H.264 + Opus
+                                                               WHIP HTTP POST
+                                                               ICE + DTLS-SRTP
+                                                                      │
+                                                            WHIP ingest endpoint
 ```
 
-**Why GStreamer over FFmpeg+relay:**
+**Key design notes (gst-plugins-rs ≥ 1.24):**
 
-- Single pipeline — no intermediate mux/demux hop, lowest achievable latency
-- `whipclientsink` is the only production-grade open-source WHIP *client* on Linux
-- Both the NDI and WebRTC plugins live in `gst-plugins-rs` — same build, same GStreamer version
-- `queue leaky=downstream` on both paths prevents back-pressure from stalling NDI receive
-- `constrained-baseline` H.264 profile is accepted by every WHIP server without SDP surprises
+- `whipclientsink` is `GstBaseWebRTCSink` — it accepts **raw** video/audio and
+  handles codec negotiation and encoding internally. Do not pre-encode.
+- `video-caps="video/x-h264"` constrains codec selection to H.264, which is
+  required for compatibility with Safari and most WHIP servers.
+- `ndisrcdemux` (not `ndidemux`) is the correct pad demuxer name in 1.24.x.
+- `signaller::whip-endpoint` (GstChildProxy child property) replaces the old
+  `sig-server-url` property removed in 1.24.
 
 ---
 
@@ -63,21 +69,26 @@ ndisrc  ──►  ndidemux
 
 | Component | Minimum version | Notes |
 |---|---|---|
-| Ubuntu | 22.04 LTS | 24.04 preferred (newer GStreamer) |
-| GStreamer | 1.20 | 1.22+ preferred |
-| Rust / Cargo | stable | Only needed at build time |
+| Ubuntu | 22.04 LTS | 24.04 preferred (ships GStreamer 1.24) |
+| GStreamer | 1.20 | 1.24 recommended; must match gst-plugins-rs tag |
+| Rust / Cargo | stable | Build-time only |
 | NDI SDK | v5 or v6 | Proprietary — download from ndi.tv |
-| Python | 3.10 | 3.11+ gets tomllib without extra install |
+| Python | 3.10 | 3.11+ gets `tomllib` without extra install |
 | libnice | any | Ships with Ubuntu — ICE for WebRTC |
 | libsrtp2 | any | Ships with Ubuntu — SRTP |
-| libx264 | any | Ships with Ubuntu — software H.264 |
-| libopus | any | Ships with Ubuntu — Opus audio |
 
 ---
 
 ## Installation
 
-> Run all steps on the target Ubuntu server. Steps 1–4 require root or sudo.
+> Run all steps on the target Ubuntu server. The automated installer handles
+> everything below — run it if you prefer:
+>
+> ```bash
+> sudo bash install.sh
+> ```
+>
+> The NDI SDK must be installed manually first (step 3).
 
 ### 1. System packages
 
@@ -99,36 +110,22 @@ sudo apt install -y \
   libsrtp2-dev \
   libx264-dev \
   libopus-dev \
-  build-essential pkg-config git curl nasm \
+  build-essential pkg-config cmake ninja-build meson \
+  git curl wget ca-certificates nasm \
   python3 python3-pip python3-venv python3-gi \
+  python3-gi-cairo \
   gir1.2-gstreamer-1.0 \
   gir1.2-gst-plugins-base-1.0
 ```
 
-**Ubuntu 22.04 note:** Ships GStreamer 1.20. If you hit API errors during the Rust
-build, install a newer GStreamer via the developers PPA:
-
-```bash
-sudo add-apt-repository ppa:gstreamer-developers/ppa
-sudo apt update && sudo apt upgrade
-```
-
-Or upgrade to Ubuntu 24.04 (ships GStreamer 1.24, recommended for new deployments).
+**Ubuntu 22.04 note:** Ships GStreamer 1.20. Upgrade to 24.04 for GStreamer 1.24,
+which is the recommended target for this project.
 
 ---
 
 ### 2. Rust toolchain
 
-Rust is required to build `gst-plugins-rs`. It is only needed at build time.
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source ~/.cargo/env   # or open a new shell
-
-cargo --version       # verify
-```
-
-For an unattended server install (system-wide):
+Rust is required to build `gst-plugins-rs`. Only needed at build time.
 
 ```bash
 export CARGO_HOME=/opt/cargo
@@ -136,25 +133,24 @@ export RUSTUP_HOME=/opt/rustup
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | sh -s -- -y --no-modify-path --profile minimal
 export PATH="/opt/cargo/bin:$PATH"
+
+cargo --version   # verify
 ```
 
 ---
 
 ### 3. NDI SDK (manual)
 
-The NDI SDK is proprietary software that requires accepting a licence agreement.
-It cannot be downloaded automatically.
-
-**Steps:**
+The NDI SDK is proprietary and requires accepting a licence agreement.
 
 1. Go to **https://www.ndi.tv/sdk/** and create a free account
-2. Download the Linux installer — look for a file like `Install_NDI_SDK_v6_Linux.tar.gz`
-3. Extract and run the installer:
+2. Download the Linux installer (`Install_NDI_SDK_v6_Linux.tar.gz` or similar)
+3. Extract and run:
 
 ```bash
 tar -xzf Install_NDI_SDK_v6_Linux.tar.gz
 sudo bash Install_NDI_SDK_v6_Linux.sh
-# Accept the EULA, choose install path /usr/local (the default)
+# Accept the EULA, install to /usr/local (the default)
 sudo ldconfig
 ```
 
@@ -169,36 +165,40 @@ ls /usr/local/lib/libndi.so*                 # must exist
 
 ### 4. Build GStreamer plugins
 
-This builds `libgstndi.so` (NDI source/sink) and `libgstrswebrtc.so` (WHIP client)
-from the `gst-plugins-rs` Rust workspace.
+Builds `libgstndi.so` (NDI source) and `libgstrswebrtc.so` (WHIP client) from
+the `gst-plugins-rs` Rust workspace. The tag must match your system GStreamer version.
 
 ```bash
 git clone --branch gstreamer-1.24.13 --depth 1 \
   https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git
 cd gst-plugins-rs
 
-# Build both plugins (takes 5–15 minutes on first run)
+# Build both plugins (5–15 minutes on first run)
 NDI_SDK_DIR=/usr/local cargo build --release \
   --package gst-plugin-ndi \
   --package gst-plugin-webrtc
 
 # Install to the system GStreamer plugin directory
-sudo install -m 755 target/release/libgstndi.so     /usr/local/lib/gstreamer-1.0/
+sudo mkdir -p /usr/local/lib/gstreamer-1.0
+sudo install -m 755 target/release/libgstndi.so      /usr/local/lib/gstreamer-1.0/
 sudo install -m 755 target/release/libgstrswebrtc.so /usr/local/lib/gstreamer-1.0/
 sudo ldconfig
 ```
 
-> **Note:** In gst-plugins-rs ≥ 1.24 the WebRTC plugin is named `libgstrswebrtc.so`
-> (not `libgstwebrtc.so`). Set `GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0` so
-> GStreamer finds it instead of the system `libgstwebrtc.so` from
-> `gstreamer1.0-plugins-bad`, which provides `webrtcbin` but NOT `whipclientsink`.
+> **Important:** The file is `libgstrswebrtc.so` (with `rs`), not `libgstwebrtc.so`.
+> The Ubuntu package `gstreamer1.0-plugins-bad` ships `libgstwebrtc.so` which provides
+> `webrtcbin` but **not** `whipclientsink`. Always set:
+> ```bash
+> export GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
+> ```
 
-**Verify both elements are available:**
+**Verify both elements load:**
 
 ```bash
 export GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
 gst-inspect-1.0 ndisrc          # must print element details
-gst-inspect-1.0 whipclientsink  # must print element details
+gst-inspect-1.0 ndisrcdemux     # must print element details
+gst-inspect-1.0 whipclientsink  # must print GstWhipWebRTCSink details
 ```
 
 ---
@@ -212,34 +212,100 @@ sudo usermod -aG video,audio ndi-whip
 
 # Create directories
 sudo mkdir -p /opt/ndi_to_whip /etc/ndi_to_whip /var/log/ndi_to_whip
+sudo mkdir -p /var/cache/gstreamer-1.0
 
-# Copy application files (from this repo)
+# Copy application files
 sudo cp ndi_to_whip.py /opt/ndi_to_whip/
 sudo cp config.toml    /etc/ndi_to_whip/
 sudo chmod +x /opt/ndi_to_whip/ndi_to_whip.py
 sudo chmod 640 /etc/ndi_to_whip/config.toml
 
-# Python virtual environment
-sudo python3 -m venv /opt/ndi_to_whip/venv
+# Python virtual environment (--system-site-packages for PyGObject access)
+sudo python3 -m venv --system-site-packages /opt/ndi_to_whip/venv
 sudo /opt/ndi_to_whip/venv/bin/pip install --upgrade pip
 sudo /opt/ndi_to_whip/venv/bin/pip install tomli structlog
+
+# GStreamer registry cache (writable by service user under ProtectSystem=strict)
+sudo chown ndi-whip:ndi-whip /var/cache/gstreamer-1.0
 
 # Fix ownership
 sudo chown -R ndi-whip:ndi-whip /opt/ndi_to_whip /var/log/ndi_to_whip
 
-# Persist environment for all shells
+# Persist NDI library path
 echo '/usr/local/lib' | sudo tee /etc/ld.so.conf.d/ndi.conf
 sudo ldconfig
+
+# Persist environment for all shells
+sudo tee /etc/profile.d/ndi_to_whip.sh <<'EOF'
+export GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
+export LD_LIBRARY_PATH=/usr/local/lib
+export NDI_SDK_DIR=/usr/local
+EOF
 
 # Install systemd service
 sudo cp ndi-to-whip.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
-Or run the automated installer (still requires NDI SDK to already be installed):
+---
+
+## MediaMTX — local WHIP server
+
+[MediaMTX](https://github.com/bluenviron/mediamtx) is a lightweight media server
+that acts as a WHIP ingest endpoint and re-publishes the stream over WebRTC, HLS,
+RTSP, and RTMP.
+
+### Install MediaMTX
 
 ```bash
-sudo bash install.sh
+# Download latest release (check https://github.com/bluenviron/mediamtx/releases)
+wget https://github.com/bluenviron/mediamtx/releases/download/v1.12.2/mediamtx_v1.12.2_linux_amd64.tar.gz
+tar -xzf mediamtx_v1.12.2_linux_amd64.tar.gz
+sudo mv mediamtx /usr/local/bin/
+
+# Create config directory and install config
+sudo mkdir -p /etc/mediamtx
+sudo cp mediamtx.yml /etc/mediamtx/mediamtx.yml
+```
+
+### Configure MediaMTX
+
+The included `mediamtx.yml` is pre-configured for this project:
+
+```yaml
+webrtcAddress: :8889
+
+paths:
+  live: {}
+```
+
+### Run as a systemd service
+
+Create `/etc/systemd/system/mediamtx.service`:
+
+```ini
+[Unit]
+Description=MediaMTX
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now mediamtx
+```
+
+### WHIP endpoint for config.toml
+
+```toml
+[whip]
+url = "http://127.0.0.1:8889/live/whip"
 ```
 
 ---
@@ -247,15 +313,15 @@ sudo bash install.sh
 ## Configuration
 
 Edit `/etc/ndi_to_whip/config.toml` before starting the service.
-Every field is documented inline in the file. Key settings:
+Restart after any change: `sudo systemctl restart ndi-to-whip`
 
 ```toml
 [ndi]
 source_name = "MYCOMPUTER (Stream 1)"   # exact NDI source name
 
 [whip]
-url        = "https://your-whip-endpoint/whip"
-auth_token = "your-bearer-token"        # leave "" if not required
+url         = "http://127.0.0.1:8889/live/whip"
+auth_token  = ""                        # Bearer token, leave "" if not required
 stun_server = "stun://stun.l.google.com:19302"
 
 [video]
@@ -275,10 +341,10 @@ bitrate_bps = 128000
 
 | Service | URL format |
 |---|---|
+| MediaMTX (local) | `http://127.0.0.1:8889/live/whip` |
 | Cloudflare Stream | `https://customer-<id>.cloudflarestream.com/<stream-key>/webRTC/publish` |
 | LiveKit | `https://your-livekit-host/whip` |
 | Janus (local) | `http://127.0.0.1:8088/janus/whip` |
-| MediaMTX (local) | `http://127.0.0.1:8889/<stream-name>/whip` |
 
 ---
 
@@ -287,25 +353,26 @@ bitrate_bps = 128000
 ### Manual / foreground
 
 ```bash
-# Discover available NDI sources on the network
+# Required environment (set automatically by the systemd unit)
+export GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
+export LD_LIBRARY_PATH=/usr/local/lib
+
+# Discover NDI sources on the network
 /opt/ndi_to_whip/venv/bin/python /opt/ndi_to_whip/ndi_to_whip.py --probe
 
-# Print the generated GStreamer pipeline (for manual testing)
+# Print the generated GStreamer pipeline without running it
 /opt/ndi_to_whip/venv/bin/python /opt/ndi_to_whip/ndi_to_whip.py \
   --config /etc/ndi_to_whip/config.toml --print-pipeline
 
-# Run interactively with config file
-GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
-LD_LIBRARY_PATH=/usr/local/lib \
+# Run interactively
 /opt/ndi_to_whip/venv/bin/python /opt/ndi_to_whip/ndi_to_whip.py \
   --config /etc/ndi_to_whip/config.toml
 
-# Override any config value on the command line
+# Run with inline overrides (no config file needed)
 /opt/ndi_to_whip/venv/bin/python /opt/ndi_to_whip/ndi_to_whip.py \
   --ndi-source "MYPC (Camera 1)" \
   --whip-url "http://127.0.0.1:8889/live/whip" \
   --width 1280 --height 720 --framerate 30 \
-  --video-bitrate 2500 \
   --log-level DEBUG
 ```
 
@@ -314,7 +381,7 @@ Stop with `Ctrl+C` — triggers a clean SIGINT shutdown.
 ### As a systemd service
 
 ```bash
-# Enable and start
+# Enable and start (also starts on every boot)
 sudo systemctl enable --now ndi-to-whip
 
 # Check status
@@ -323,7 +390,7 @@ sudo systemctl status ndi-to-whip
 # Follow live logs
 sudo journalctl -u ndi-to-whip -f
 
-# Restart after a config change
+# Restart after config changes
 sudo systemctl restart ndi-to-whip
 
 # Stop
@@ -331,9 +398,59 @@ sudo systemctl stop ndi-to-whip
 
 # View last 200 log lines
 sudo journalctl -u ndi-to-whip -n 200 --no-pager
+```
 
-# Logs since a specific time
-sudo journalctl -u ndi-to-whip --since "2024-01-15 10:00:00"
+---
+
+## Viewing the stream
+
+When using MediaMTX as the WHIP server, the stream is available on multiple protocols.
+
+### WebRTC (lowest latency, ~0.5s)
+
+Open in a browser:
+```
+http://<server-ip>:8889/live/
+```
+
+> **Note:** WebRTC playback requires ICE to succeed. If the browser and server are
+> on different subnets or behind NAT, ICE may fail. Add `webrtcLocalUDPAddress`
+> to `/etc/mediamtx/mediamtx.yml` to help:
+> ```yaml
+> webrtcLocalUDPAddress: <server-ip>:8189
+> ```
+
+### HLS (~5–10s latency)
+
+Open in a browser or media player:
+```
+http://<server-ip>:8888/live/
+```
+
+Direct playlist URL:
+```
+http://<server-ip>:8888/live/index.m3u8
+```
+
+> **Safari / iOS note:** Safari does not support Opus audio in HLS. The HLS stream
+> will show a broken play button in Safari. Use VLC (see below) or the WebRTC
+> player instead.
+
+### VLC (recommended for iOS / Android)
+
+1. Install **VLC** from the App Store or Google Play
+2. Tap the network/stream icon → **Open Network Stream**
+3. Enter:
+   ```
+   http://<server-ip>:8888/live/index.m3u8
+   ```
+
+VLC supports Opus audio and plays the HLS stream reliably on all platforms.
+
+### RTSP
+
+```
+rtsp://<server-ip>:8554/live
 ```
 
 ---
@@ -343,7 +460,7 @@ sudo journalctl -u ndi-to-whip --since "2024-01-15 10:00:00"
 ### Pre-flight checklist
 
 ```bash
-# Runs ~20 automated checks and prints pass/warn/fail for each
+# Runs ~20 automated checks and prints pass/warn/fail
 sudo bash validate.sh
 
 # Skip the 5-second NDI network scan
@@ -357,73 +474,39 @@ GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
 /opt/ndi_to_whip/venv/bin/python /opt/ndi_to_whip/ndi_to_whip.py --validate
 ```
 
-### Test the raw GStreamer pipeline manually
-
-Copy the output of `--print-pipeline` and run it directly with `gst-launch-1.0`.
-Add `GST_DEBUG=whipclientsink:4` to see the WHIP HTTP exchange:
+### Test the pipeline manually with gst-launch-1.0
 
 ```bash
-GST_DEBUG=whipclientsink:4,ndisrc:3 \
+GST_DEBUG=whipclientsink:4 \
 GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
 LD_LIBRARY_PATH=/usr/local/lib \
 gst-launch-1.0 \
   whipclientsink name=whip \
-    sig-server-url="http://127.0.0.1:8889/live/whip" \
-  ndisrc ndi-name="SOURCENAME" ! ndidemux name=d \
-  d.video ! queue leaky=downstream ! videoconvert ! videoscale ! videorate ! \
-    "video/x-raw,format=I420,width=1280,height=720,framerate=30/1" ! \
-    x264enc tune=zerolatency speed-preset=ultrafast bitrate=2500 key-int-max=60 ! \
-    "video/x-h264,profile=constrained-baseline" ! \
-    rtph264pay config-interval=-1 aggregate-mode=zero-latency pt=102 ! whip. \
-  d.audio ! queue leaky=downstream ! audioconvert ! audioresample ! \
-    "audio/x-raw,rate=48000,channels=2" ! \
-    opusenc bitrate=128000 ! rtpopuspay pt=111 ! whip.
+    signaller::whip-endpoint="http://127.0.0.1:8889/live/whip" \
+    video-caps="video/x-h264" \
+  ndisrc ndi-name="SOURCENAME" ! ndisrcdemux name=demux \
+  demux.video ! queue leaky=downstream ! videoconvert ! videoscale ! videorate ! \
+    "video/x-raw,format=I420,width=1280,height=720,framerate=30/1" ! whip. \
+  demux.audio ! queue leaky=downstream ! audioconvert ! audioresample ! \
+    "audio/x-raw,rate=48000,channels=2,format=S16LE,layout=interleaved" ! whip.
 ```
 
-### Test WHIP signalling independently
+### Test with a video test source (no NDI required)
 
 ```bash
-# A 201 Created response confirms the WHIP endpoint accepts your token and SDP
-curl -v -X POST \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/sdp" \
-  -d "v=0
-o=- 0 0 IN IP4 127.0.0.1
-s=-
-t=0 0
-m=video 9 UDP/TLS/RTP/SAVPF 102
-c=IN IP4 0.0.0.0
-a=rtpmap:102 H264/90000
-m=audio 9 UDP/TLS/RTP/SAVPF 111
-c=IN IP4 0.0.0.0
-a=rtpmap:111 opus/48000/2" \
-  "https://YOUR_WHIP_ENDPOINT"
+GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
+gst-launch-1.0 \
+  whipclientsink name=whip \
+    signaller::whip-endpoint="http://127.0.0.1:8889/live/whip" \
+    video-caps="video/x-h264" \
+  videotestsrc ! video/x-raw,width=1280,height=720,framerate=30/1 ! whip. \
+  audiotestsrc ! audio/x-raw,rate=48000,channels=2 ! whip.
 ```
 
-### Verify NDI is visible on the network
+### Verify HLS segments are being served
 
 ```bash
-# Check multicast traffic from NDI senders
-sudo tcpdump -i eth0 -n udp port 5353
-
-# Check NDI UDP port range
-sudo tcpdump -i eth0 -n 'udp portrange 5960-5970'
-```
-
-### Monitor performance
-
-```bash
-# CPU usage
-top -p $(pgrep -f ndi_to_whip.py)
-
-# Memory
-cat /proc/$(pgrep -f ndi_to_whip.py)/status | grep VmRSS
-
-# GStreamer performance counters
-GST_DEBUG="GST_PERFORMANCE:5" /opt/ndi_to_whip/venv/bin/python ...
-
-# Encoder-specific debug (dropped frames etc.)
-GST_DEBUG="x264enc:4,videorate:4" /opt/ndi_to_whip/venv/bin/python ...
+curl -s http://127.0.0.1:8888/live/index.m3u8
 ```
 
 ---
@@ -432,213 +515,159 @@ GST_DEBUG="x264enc:4,videorate:4" /opt/ndi_to_whip/venv/bin/python ...
 
 ### NDI source not found / `--probe` returns nothing
 
-```
-No NDI sources found.
-```
-
-NDI uses mDNS (UDP/5353) for discovery and UDP/5960 for video/audio. These must be
-unblocked at the network and firewall level.
+NDI uses mDNS (UDP/5353) for discovery and UDP/5960 for video. Both must be open.
 
 ```bash
-# Open ports on ufw
 sudo ufw allow 5353/udp
 sudo ufw allow 5960
 
-# Verify multicast works on the interface
+# Verify multicast route
 ip route show | grep '224.0.0.0'
 # If missing:
 sudo ip route add 224.0.0.0/4 dev eth0
-
-# Force unicast discovery by specifying the sender's IP
-# In config.toml: source_name = "192.168.1.50 (Stream Name)"
 ```
 
-NDI discovery also fails across VLANs unless multicast is explicitly routed. If your
-NDI sender is on a different VLAN, consult your switch documentation or configure the
-sender to use a static unicast address.
+NDI discovery fails across VLANs unless multicast is routed. If your NDI sender
+is on a different VLAN, specify its IP directly in `source_name`:
+```toml
+source_name = "192.168.1.50 (Stream Name)"
+```
 
 ---
 
-### `ndisrc` or `ndidemux` element not available
-
-```
-(gst) No such element or plugin 'ndisrc'
-```
-
-The plugin file is not in `GST_PLUGIN_PATH` or failed to load.
+### `ndisrc` or `ndisrcdemux` element not found
 
 ```bash
-# Confirm the file exists
+# Confirm the plugin file exists
 ls -lh /usr/local/lib/gstreamer-1.0/libgstndi.so
-
-# Check it loads cleanly
-gst-inspect-1.0 --print-all 2>&1 | grep -i ndi
 
 # Check for missing shared library dependencies
 ldd /usr/local/lib/gstreamer-1.0/libgstndi.so | grep "not found"
 # If libndi.so is missing:
 sudo ldconfig
-# If still missing:
-ls /usr/local/lib/libndi.so*   # confirm NDI SDK is installed
 ```
 
 ---
 
-### `whipclientsink` not found (wrong plugin loaded)
-
-```
-(gst) No such element 'whipclientsink'
-# OR gst-inspect shows webrtcbin info instead
-```
-
-The `libgstrswebrtc.so` plugin was not installed, or `GST_PLUGIN_PATH` is not set.
+### `whipclientsink` not found
 
 ```bash
-# Confirm the file exists
+# Confirm the file exists (note: libgstrswebrtc.so, not libgstwebrtc.so)
 ls /usr/local/lib/gstreamer-1.0/libgstrswebrtc.so
 
 # Verify with GST_PLUGIN_PATH set
 GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 gst-inspect-1.0 whipclientsink
 ```
 
+If `gst-inspect-1.0 whipclientsink` shows `webrtcbin` info instead of
+`GstWhipWebRTCSink`, the Ubuntu system plugin is loading instead of the
+`gst-plugins-rs` build. Ensure `GST_PLUGIN_PATH` is set correctly.
+
+---
+
+### `No codec available for encoding stream video_0`
+
+`GstBaseWebRTCSink` scans for encoder factories that accept `video/x-raw`. Common causes:
+
+1. **WHIP server not running** — `curl http://127.0.0.1:8889/live/whip` should return HTTP (not connection refused)
+2. **`CapabilityBoundingSet=` (empty) in systemd unit** — drops all Linux capabilities, blocking GStreamer codec discovery. Do not set an empty `CapabilityBoundingSet`.
+3. **`PrivateTmp=true` in systemd unit** — NDI SDK uses `/tmp` for IPC. Keep `PrivateTmp` disabled.
+4. **GStreamer registry not writable** — the service user needs write access to `/var/cache/gstreamer-1.0`
+
+---
+
+### WHIP connection refused
+
+```
+error trying to connect: tcp connect error: Connection refused (os error 111)
+```
+
+The WHIP server is not running or not listening on the configured URL.
+
+```bash
+# For MediaMTX:
+sudo systemctl status mediamtx
+curl -v http://127.0.0.1:8889/live/whip
+```
+
+---
+
+### WebRTC / ICE timeout (viewer can't connect)
+
+```
+deadline exceeded while waiting connection
+```
+
+MediaMTX is not advertising the correct ICE candidates for your network.
+Add your server's IP to `/etc/mediamtx/mediamtx.yml`:
+
+```yaml
+webrtcLocalUDPAddress: <server-ip>:8189
+```
+
+Then open firewall port `8189/udp` if using ufw:
+```bash
+sudo ufw allow 8189/udp
+```
+
+---
+
+### HLS broken play button in Safari / iOS
+
+Safari does not support Opus audio in HLS streams. Use VLC instead:
+
+1. Install VLC from the App Store
+2. Open Network Stream: `http://<server-ip>:8888/live/index.m3u8`
+
 ---
 
 ### WHIP HTTP 401 / 403
 
-```
-GST_DEBUG output: HTTP 401 Unauthorized  or  403 Forbidden
-```
-
-- Verify `auth_token` in config is correct and not expired
-- Some WHIP servers expect the token as a URL query param (`?access_token=...`)
-  rather than an `Authorization: Bearer` header — check your server's docs
-- For Cloudflare Stream: use the **stream key**, not the account API token
-
----
-
-### ICE fails — signalling succeeds but no media arrives
-
-```
-whip-connected fires, stream never appears at receiver
-```
-
-Direct UDP is being blocked. You need a TURN relay.
-
-```bash
-# Test whether outbound UDP works at all
-nc -uzv stun.l.google.com 19302    # should succeed
-
-# Add a TURN server to config.toml:
-# turn_server = "turn://username:password@your-coturn-server:3478"
-
-# Install coturn locally if needed
-sudo apt install coturn
-```
-
----
-
-### `ndidemux` pad names mismatch — pipeline fails to link
-
-```
-(gst) could not link ndidemux0 to queue
-```
-
-Different plugin versions expose different pad template names. Find yours:
-
-```bash
-gst-inspect-1.0 ndidemux
-# Look for "SRC template" entries — note the pad name pattern
-```
-
-Then edit `build_pipeline_string()` in `ndi_to_whip.py` and change `demux.video` /
-`demux.audio` to match. Common alternatives: `demux.src_0` / `demux.src_1`, or
-unnamed request pads.
-
-If you want a more resilient alternative, replace the `ndisrc ! ndidemux` block with
-`decodebin`, which auto-negotiates pad types:
-
-```python
-# In ndi_to_whip.py, change the pipeline block to:
-"ndisrc ndi-name='...' ! decodebin name=dec"
-# Then use "dec." for both video and audio chains
-```
-
----
-
-### High CPU / dropped frames
-
-```
-GST videorate: dropped N frames
-top shows 100% CPU on a single core
-```
-
-Software H.264 encoding is CPU-bound. Options in order of preference:
-
-1. Switch to hardware encoding — see [Hardware Encoding](#hardware-encoding)
-2. Lower resolution: `width=1280, height=720`
-3. Lower framerate: `framerate=25` or `framerate=24`
-4. Lower bitrate: `bitrate_kbps=2000`
-5. Use `speed-preset=superfast` instead of `ultrafast` (slightly better quality,
-   similar CPU cost)
+- Verify `auth_token` in `config.toml` is correct and not expired
+- Some servers expect the token as a URL query param instead of a header
 
 ---
 
 ### Service restarts in a tight loop
 
-```
-journalctl shows repeated start/stop within seconds
-```
-
-Check the exit reason:
-
 ```bash
-sudo journalctl -u ndi-to-whip -n 50 --no-pager | grep -E "ERROR|WARN|Failed"
+sudo journalctl -u ndi-to-whip -n 50 --no-pager | grep -E "error|WARN|Failed"
 ```
 
 Common causes:
-- NDI source name is wrong — run `--probe` to get the exact string
+- NDI source name is wrong — run `--probe` to get the exact name
 - WHIP URL is unreachable — `curl -v YOUR_WHIP_URL`
-- `config.toml` has a syntax error — `python -c "import tomllib; tomllib.load(open('/etc/ndi_to_whip/config.toml','rb'))"`
-- Permission denied on log dir — `ls -la /var/log/ndi_to_whip/`
-
-Increase retry delay to slow the loop while debugging:
-```toml
-[retry]
-initial_delay_s = 15.0
-```
+- `config.toml` syntax error — test with:
+  ```bash
+  python3 -c "import tomllib; tomllib.load(open('/etc/ndi_to_whip/config.toml','rb'))"
+  ```
 
 ---
 
 ## Hardware Encoding
 
-Software `x264enc` is the default because it works everywhere without extra
-dependencies. For production on real hardware, switch to GPU encoding.
+`x264enc` (software) is the default. For production, switch to GPU encoding.
 
 ### Intel / AMD — VAAPI
 
 ```bash
-# Verify VA-API support
 sudo apt install vainfo
 vainfo   # must show VAProfileH264ConstrainedBaseline ... VAEntrypointEncSlice
 
-# Enable in config.toml
+# In config.toml:
 # encoder = "vaapi"
 
-# Add service user to render group (Intel iGPU)
+# Add service user to render group
 sudo usermod -aG render ndi-whip
 ```
 
 ### NVIDIA — NVENC
 
 ```bash
-# Verify NVENC support
 nvidia-smi
 gst-inspect-1.0 nvh264enc   # must print element info
 
-# Install CUDA and NVENC GStreamer plugin if missing
-sudo apt install gstreamer1.0-plugins-bad  # contains nvh264enc on NVIDIA systems
-
-# Enable in config.toml
+# In config.toml:
 # encoder = "nvenc"
 ```
 
@@ -648,14 +677,14 @@ sudo apt install gstreamer1.0-plugins-bad  # contains nvh264enc on NVIDIA system
 
 | Limitation | Impact | Workaround |
 |---|---|---|
-| NDI SDK is proprietary | Manual install required | Script fails clearly and prints download URL |
-| `gst-plugins-rs` requires Rust build | No Ubuntu package; 5–15 min build | Build once, pin git tag, cache `target/` |
-| `ndidemux` pad names vary by plugin version | Pipeline may fail to link | Use `gst-inspect-1.0 ndidemux` to find pad names; adjust pipeline string |
-| H.264 constrained-baseline only | No B-frames, capped quality | Sufficient for live broadcast; VP9 profile can be added |
+| NDI SDK is proprietary | Manual install required | Script fails clearly and prints the download URL |
+| `gst-plugins-rs` requires Rust build | No Ubuntu package; 5–15 min build | Build once, pin the git tag |
+| gst-plugins-rs API changed in 1.24 | `sig-server-url`, `ndidemux`, pre-encoded input all removed | Use `signaller::whip-endpoint`, `ndisrcdemux`, raw A/V input |
+| `GstBaseWebRTCSink` controls encoding | `encoder` and `bitrate_kbps` config fields are hints; actual bitrate is WebRTC-negotiated | Set `video-caps="video/x-h264"` to constrain codec selection |
+| Safari iOS rejects Opus in HLS | HLS broken play button on iPhone/iPad | Use VLC, or the WebRTC player at `:8889` |
+| WebRTC ICE may fail across subnets | Viewer can't connect | Set `webrtcLocalUDPAddress` in mediamtx.yml |
 | WHIP ICE without TURN fails behind symmetric NAT | No media after signalling | Add TURN server to `[whip] turn_server` |
-| No hardware encoding on VMs without GPU passthrough | High CPU at 1080p | Use x264 at 720p30, or add GPU passthrough |
-| Python GIL + GLib main loop threading | Minor risk of deadlock on unusual errors | `_loop_thread` is a daemon thread; SIGTERM always terminates |
-| NDI SDK licence restricts redistribution | Cannot package libndi.so in a .deb | Automate install post-SDK-download only |
+| NDI SDK licence restricts redistribution | Cannot package `libndi.so` in a .deb | Automate install post-SDK-download only |
 
 ---
 
@@ -666,6 +695,7 @@ ndi_to_whip/
 ├── install.sh            Full system installer (run as root)
 ├── ndi_to_whip.py        Main Python application
 ├── config.toml           Configuration — edit before first run
+├── mediamtx.yml          MediaMTX config for local WHIP server
 ├── ndi-to-whip.service   systemd unit file
 ├── validate.sh           Pre-flight checklist and troubleshooting
 └── README.md             This file
