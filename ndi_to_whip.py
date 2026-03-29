@@ -94,8 +94,8 @@ class Config:
     video_width: int              = 1920
     video_height: int             = 1080
     video_framerate: int          = 30
-    video_bitrate_kbps: int       = 4000    # kbps for H.264 encoder
-    video_encoder: str            = "x264"  # x264 | vaapi | nvenc
+    video_bitrate_kbps: int       = 4000    # kbps; sets start/min/max-bitrate on whipclientsink
+    video_encoder: str            = "x264"  # informational; GstBaseWebRTCSink selects encoder via codec discovery
     video_keyframe_interval: int  = 0       # 0 = 2× framerate
 
     # Audio
@@ -192,6 +192,10 @@ def load_config(config_path: Optional[str], overrides: dict) -> Config:
 # PIPELINE BUILDER
 # =============================================================================
 
+# NOTE: In gst-plugins-rs >= 1.24, whipclientsink (GstBaseWebRTCSink) handles
+# codec selection and encoding internally via factory discovery. ENCODER_PROFILES
+# is retained for CLI --encoder validation and future use but is not inserted
+# into the pipeline string. The active codec is constrained by video-caps="video/x-h264".
 ENCODER_PROFILES = {
     "x264": {
         "encoder":  (

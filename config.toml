@@ -56,16 +56,21 @@ height = 1080
 framerate = 30
 
 # H.264 bitrate in kilobits per second.
+# Sets start-bitrate, min-bitrate, and max-bitrate on whipclientsink, locking
+# the WebRTC encoder at this rate (disables congestion control scaling).
 # Rough guidance:
 #   720p@30fps:   2000–4000 kbps
-#   1080p@30fps:  4000–8000 kbps
-#   1080p@60fps:  6000–12000 kbps
+#   1080p@30fps:  4000–10000 kbps
+#   1080p@60fps:  6000–15000 kbps
 bitrate_kbps = 4000
 
-# Video encoder backend:
-#   x264  — software (works everywhere, highest CPU usage)
-#   vaapi — Intel/AMD GPU hardware encode (requires vainfo to show h264_enc)
-#   nvenc — NVIDIA GPU hardware encode (requires nvidia-smi + nvh264enc)
+# Encoder hint — informational only.
+# GstBaseWebRTCSink (whipclientsink) selects the encoder internally via GStreamer
+# factory discovery. The codec is constrained to H.264 by video-caps="video/x-h264".
+# Ensure the corresponding GStreamer encoder element is installed:
+#   x264  — x264enc  (gstreamer1.0-plugins-ugly + libx264)
+#   vaapi — vaapih264enc  (gstreamer1.0-vaapi, Intel/AMD GPU)
+#   nvenc — nvh264enc  (gstreamer1.0-plugins-bad, NVIDIA GPU)
 encoder = "x264"
 
 # IDR keyframe interval in frames.  0 = auto (2 × framerate).

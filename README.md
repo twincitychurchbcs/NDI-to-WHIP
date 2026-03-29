@@ -646,29 +646,37 @@ Common causes:
 
 ## Hardware Encoding
 
-`x264enc` (software) is the default. For production, switch to GPU encoding.
+`whipclientsink` (`GstBaseWebRTCSink`) selects the H.264 encoder automatically via
+GStreamer factory discovery — it picks the first available encoder that produces
+`video/x-h264`. To use GPU encoding, install the relevant GStreamer plugin and
+the sink will prefer it over software `x264enc`.
 
 ### Intel / AMD — VAAPI
 
 ```bash
-sudo apt install vainfo
-vainfo   # must show VAProfileH264ConstrainedBaseline ... VAEntrypointEncSlice
+sudo apt install gstreamer1.0-vaapi vainfo
+vainfo   # must show VAProfileH264Main or VAProfileH264ConstrainedBaseline ... VAEntrypointEncSlice
 
-# In config.toml:
-# encoder = "vaapi"
-
-# Add service user to render group
+# Add service user to render group (required for GPU access)
 sudo usermod -aG render ndi-whip
+sudo systemctl restart ndi-to-whip
 ```
 
 ### NVIDIA — NVENC
 
 ```bash
-nvidia-smi
-gst-inspect-1.0 nvh264enc   # must print element info
+nvidia-smi                              # verify GPU is present
+gst-inspect-1.0 nvh264enc              # must print element info
 
-# In config.toml:
-# encoder = "nvenc"
+# If nvh264enc is missing:
+sudo apt install gstreamer1.0-plugins-bad
+sudo systemctl restart ndi-to-whip
+```
+
+To verify which encoder was selected:
+
+```bash
+GST_DEBUG=GstBaseWebRTCSink:5 sudo journalctl -u ndi-to-whip -f
 ```
 
 ---

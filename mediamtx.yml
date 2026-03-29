@@ -20,8 +20,14 @@
 # WebRTC / WHIP listener port
 webrtcAddress: :8889
 
+# Uncomment and set to your server's LAN IP if WebRTC viewers fail to connect.
+# This advertises the correct ICE candidate when MediaMTX is behind a switch/router.
+# webrtcLocalUDPAddress: 192.168.1.100:8189
+
 paths:
   # The stream path that whipclientsink publishes to.
   # WHIP endpoint: http://<host>:8889/live/whip
   # WebRTC playback: http://<host>:8889/live/
+  # HLS playback:   http://<host>:8888/live/
+  # VLC / RTSP:     rtsp://<host>:8554/live
   live: {}
