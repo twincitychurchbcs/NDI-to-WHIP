@@ -77,24 +77,28 @@ header "3. GSTREAMER PLUGIN ELEMENTS"
 
 declare -A ELEMENTS=(
   [ndisrc]="NDI source (gst-plugin-ndi)"
-  [ndidemux]="NDI demuxer (gst-plugin-ndi)"
-  [whipclientsink]="WHIP client sink (gst-plugin-webrtc)"
+  [ndisrcdemux]="NDI source demuxer (gst-plugin-ndi)"
+  [whipclientsink]="WHIP client sink (gst-plugin-webrtc / libgstrswebrtc.so)"
   [x264enc]="H.264 software encoder"
   [opusenc]="Opus audio encoder"
-  [rtph264pay]="RTP H.264 payloader"
-  [rtpopuspay]="RTP Opus payloader"
   [videoconvert]="Video format converter"
   [videoscale]="Video scaler"
   [videorate]="Video frame rate adjuster"
   [audioconvert]="Audio format converter"
   [audioresample]="Audio resampler"
-  [nicesink]="libnice ICE sink (WebRTC)"
 )
 
 for el in "${!ELEMENTS[@]}"; do
   gst_inspect "${el}" \
     && pass "${el}  (${ELEMENTS[$el]})" \
     || fail "${el} MISSING — ${ELEMENTS[$el]}"
+done
+
+# Optional: RTP payloaders (used internally by whipclientsink, not in pipeline)
+for el in rtph264pay rtpopuspay; do
+  gst_inspect "${el}" \
+    && pass "Optional: ${el} available (used by whipclientsink internally)" \
+    || warn "Optional: ${el} not found — whipclientsink codec discovery may fail"
 done
 
 # Optional hardware encoders

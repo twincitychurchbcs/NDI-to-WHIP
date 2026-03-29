@@ -1,0 +1,27 @@
+# MediaMTX configuration for NDI → WHIP bridge
+#
+# Install:
+#   sudo mkdir -p /etc/mediamtx
+#   sudo cp mediamtx.yml /etc/mediamtx/mediamtx.yml
+#
+# Run manually:
+#   mediamtx /etc/mediamtx/mediamtx.yml
+#
+# As a systemd service, create /etc/systemd/system/mediamtx.service:
+#   [Unit]
+#   Description=MediaMTX
+#   After=network.target
+#   [Service]
+#   ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
+#   Restart=on-failure
+#   [Install]
+#   WantedBy=multi-user.target
+
+# WebRTC / WHIP listener port
+webrtcAddress: :8889
+
+paths:
+  # The stream path that whipclientsink publishes to.
+  # WHIP endpoint: http://<host>:8889/live/whip
+  # WebRTC playback: http://<host>:8889/live/
+  live: {}

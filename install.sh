@@ -276,6 +276,12 @@ python3 -m venv --system-site-packages "${PYTHON_VENV}"
   tomli \
   structlog
 
+# GStreamer registry cache — must be writable by service user under ProtectSystem=strict
+# The service sets XDG_CACHE_HOME=/var/cache, so GStreamer writes to
+# /var/cache/gstreamer-1.0/registry.x86_64.bin
+mkdir -p /var/cache/gstreamer-1.0
+chown "${SERVICE_USER}:${SERVICE_USER}" /var/cache/gstreamer-1.0
+
 # Set ownership
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}" "${LOG_DIR}"
 chmod 750 "${LOG_DIR}"
@@ -305,6 +311,8 @@ ok "Environment persistence configured."
 # =============================================================================
 info "Installing systemd service…"
 cp "${SCRIPT_DIR}/ndi-to-whip.service" /etc/systemd/system/
+# Remove any drop-in overrides left from debugging sessions
+rm -rf /etc/systemd/system/ndi-to-whip.service.d/
 systemctl daemon-reload
 ok "systemd service installed (not started yet)."
 
