@@ -270,7 +270,7 @@ fi
 
 # Python venv with required packages
 info "Setting up Python virtual environment…"
-python3 -m venv "${PYTHON_VENV}"
+python3 -m venv --system-site-packages "${PYTHON_VENV}"
 "${PYTHON_VENV}/bin/pip" install --quiet --upgrade pip
 "${PYTHON_VENV}/bin/pip" install --quiet \
   tomli \
