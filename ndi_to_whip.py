@@ -268,6 +268,9 @@ def build_pipeline_string(cfg: Config) -> str:
     stun_prop = f'stun-server="{cfg.stun_server}"' if cfg.stun_server else ""
     turn_prop = f'turn-server="{cfg.turn_server}"' if cfg.turn_server else ""
 
+    # Bitrate in bps for GstBaseWebRTCSink (config stores kbps for video)
+    video_bps = cfg.video_bitrate_kbps * 1000
+
     pipeline = f"""
         whipclientsink name=whip
             signaller::whip-endpoint="{cfg.whip_url}"
@@ -275,6 +278,9 @@ def build_pipeline_string(cfg: Config) -> str:
             {stun_prop}
             {turn_prop}
             video-caps="video/x-h264"
+            start-bitrate={video_bps}
+            min-bitrate={video_bps}
+            max-bitrate={video_bps}
             async-handling=true
 
         ndisrc name=ndi_src
