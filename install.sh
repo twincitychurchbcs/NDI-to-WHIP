@@ -209,7 +209,7 @@ cargo build \
 # Install built plugins to GStreamer plugin path
 mkdir -p "${GST_PLUGIN_DIR}"
 find target/release -name "libgstndi.so"    -exec install -m 755 {} "${GST_PLUGIN_DIR}/" \;
-find target/release -name "libgstwebrtc.so" -exec install -m 755 {} "${GST_PLUGIN_DIR}/" \;
+find target/release -name "libgstrswebrtc.so" -exec install -m 755 {} "${GST_PLUGIN_DIR}/" \;
 ldconfig
 
 ok "gst-plugins-rs built and installed."

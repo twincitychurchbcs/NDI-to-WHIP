@@ -169,7 +169,7 @@ ls /usr/local/lib/libndi.so*                 # must exist
 
 ### 4. Build GStreamer plugins
 
-This builds `libgstndi.so` (NDI source/sink) and `libgstwebrtc.so` (WHIP client)
+This builds `libgstndi.so` (NDI source/sink) and `libgstrswebrtc.so` (WHIP client)
 from the `gst-plugins-rs` Rust workspace.
 
 ```bash
@@ -183,15 +183,15 @@ NDI_SDK_DIR=/usr/local cargo build --release \
   --package gst-plugin-webrtc
 
 # Install to the system GStreamer plugin directory
-sudo install -m 755 target/release/libgstndi.so    /usr/local/lib/gstreamer-1.0/
-sudo install -m 755 target/release/libgstwebrtc.so /usr/local/lib/gstreamer-1.0/
+sudo install -m 755 target/release/libgstndi.so     /usr/local/lib/gstreamer-1.0/
+sudo install -m 755 target/release/libgstrswebrtc.so /usr/local/lib/gstreamer-1.0/
 sudo ldconfig
 ```
 
-> **Note:** The system package `gstreamer1.0-plugins-bad` installs a *different*
-> `libgstwebrtc.so` that provides `webrtcbin` but NOT `whipclientsink`. The file
-> installed above from `gst-plugins-rs` must take precedence. Set
-> `GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0` to ensure the right one loads.
+> **Note:** In gst-plugins-rs ≥ 1.24 the WebRTC plugin is named `libgstrswebrtc.so`
+> (not `libgstwebrtc.so`). Set `GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0` so
+> GStreamer finds it instead of the system `libgstwebrtc.so` from
+> `gstreamer1.0-plugins-bad`, which provides `webrtcbin` but NOT `whipclientsink`.
 
 **Verify both elements are available:**
 
@@ -491,19 +491,14 @@ ls /usr/local/lib/libndi.so*   # confirm NDI SDK is installed
 # OR gst-inspect shows webrtcbin info instead
 ```
 
-The system's `libgstwebrtc.so` from `gstreamer1.0-plugins-bad` is loading instead
-of the one built from `gst-plugins-rs`.
+The `libgstrswebrtc.so` plugin was not installed, or `GST_PLUGIN_PATH` is not set.
 
 ```bash
-# Force the correct plugin directory
-export GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
+# Confirm the file exists
+ls /usr/local/lib/gstreamer-1.0/libgstrswebrtc.so
 
-# Verify which file is being loaded
-GST_DEBUG=3 gst-inspect-1.0 whipclientsink 2>&1 | grep "loaded"
-
-# If the system version keeps winning, rename it
-sudo mv /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstwebrtc.so \
-        /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstwebrtc.so.disabled
+# Verify with GST_PLUGIN_PATH set
+GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 gst-inspect-1.0 whipclientsink
 ```
 
 ---
