@@ -111,6 +111,11 @@ RUN apt-get update \
 # Copy prebuilt plugins from builder stage
 COPY --from=builder /staging/usr/local/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
 
+# Copy plugin verification script and run it to ensure elements registered
+COPY scripts/check_gst_plugins.sh /usr/local/bin/check_gst_plugins.sh
+RUN chmod +x /usr/local/bin/check_gst_plugins.sh && \
+   /usr/local/bin/check_gst_plugins.sh
+
 # Copy application files
 WORKDIR /opt/ndi_to_whip
 COPY . /opt/ndi_to_whip
