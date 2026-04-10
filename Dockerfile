@@ -42,6 +42,7 @@ RUN apt-get update \
     python3-gi \
     gir1.2-gstreamer-1.0 \
     gir1.2-gst-plugins-base-1.0 \
+    gir1.2-gst-plugins-bad-1.0 \
     libx264-dev \
     libopus-dev \
  && rm -rf /var/lib/apt/lists/*
@@ -104,6 +105,7 @@ RUN apt-get update \
     python3-gi \
     gir1.2-gstreamer-1.0 \
     gir1.2-gst-plugins-base-1.0 \
+    gir1.2-gst-plugins-bad-1.0 \
     libx264-dev \
     libopus0 \
  && rm -rf /var/lib/apt/lists/*
