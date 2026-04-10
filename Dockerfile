@@ -67,6 +67,12 @@ RUN curl -s https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.
    cp -r /tmp/sdk/include/* /usr/local/include/ 2>/dev/null || true && \
    cp -a /tmp/sdk/lib/x86_64-linux-gnu/* /usr/local/lib/ 2>/dev/null || true && \
    cp -a /tmp/sdk/bin/x86_64-linux-gnu/* /usr/local/bin/ 2>/dev/null || true && \
+   # Also copy SDK artifacts into /staging so they can be transferred to the
+   # final image (avoids leaving SDK only in the builder's /usr/local)
+   mkdir -p /staging/usr/local/include /staging/usr/local/lib /staging/usr/local/bin && \
+   cp -r /tmp/sdk/include/* /staging/usr/local/include/ 2>/dev/null || true && \
+   cp -a /tmp/sdk/lib/x86_64-linux-gnu/* /staging/usr/local/lib/ 2>/dev/null || true && \
+   cp -a /tmp/sdk/bin/x86_64-linux-gnu/* /staging/usr/local/bin/ 2>/dev/null || true && \
    rm -rf /tmp/sdk /tmp/Install_NDI_SDK_v6_Linux.sh || true
 
 ENV GI_TYPELIB_PATH=/usr/local/lib/girepository-1.0
@@ -126,6 +132,13 @@ RUN apt-get update \
 # Copy prebuilt plugins from builder stage
 COPY --from=builder /staging/usr/local/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
 COPY --from=builder /staging/usr/local/lib/girepository-1.0/ /usr/local/lib/girepository-1.0/
+
+# Copy staged NDI SDK artifacts (headers, libs, binaries) so the final image
+# contains the NDI runtime under /usr/local. This makes mounting /usr/local
+# unnecessary when the SDK is baked into the image (observe licensing).
+COPY --from=builder /staging/usr/local/include/ /usr/local/include/
+COPY --from=builder /staging/usr/local/lib/ /usr/local/lib/
+COPY --from=builder /staging/usr/local/bin/ /usr/local/bin/
 
 # Copy plugin verification script and run it to ensure elements registered
 COPY scripts/check_gst_plugins.sh /usr/local/bin/check_gst_plugins.sh
