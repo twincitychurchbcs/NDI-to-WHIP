@@ -82,7 +82,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 ARG GST_PLUGINS_RS_REV
 ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
-ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 # Runtime packages
 RUN apt-get update \
