@@ -40,9 +40,11 @@ RUN apt-get update \
     python3-venv \
     python3-pip \
     python3-gi \
-    gir1.2-gstreamer-1.0 \
-    gir1.2-gst-plugins-base-1.0 \
-    gir1.2-gst-plugins-bad-1.0 \
+   gir1.2-gstreamer-1.0 \
+   gir1.2-gst-plugins-base-1.0 \
+   gir1.2-gst-plugins-bad-1.0 \
+   gobject-introspection \
+   libgirepository1.0-dev \
     libx264-dev \
     libopus-dev \
  && rm -rf /var/lib/apt/lists/*
@@ -67,15 +69,25 @@ RUN curl -s https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.
    cp -a /tmp/sdk/bin/x86_64-linux-gnu/* /usr/local/bin/ 2>/dev/null || true && \
    rm -rf /tmp/sdk /tmp/Install_NDI_SDK_v6_Linux.sh || true
 
+ENV GI_TYPELIB_PATH=/usr/local/lib/girepository-1.0
 # Build gst-plugins-rs (NDI + WebRTC plugins)
 RUN git clone --branch ${GST_PLUGINS_RS_REV} --depth 1 https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git
 WORKDIR /tmp/gst-plugins-rs
 RUN cargo build --release --package gst-plugin-ndi --package gst-plugin-webrtc
 
+# Attempt to generate GIR/typelib files for Python introspection consumers.
+# This is best-effort: the script will try multiple likely namespace names
+# and write .typelib files into /staging/usr/local/lib/girepository-1.0
+COPY scripts/generate_typelibs.sh /tmp/generate_typelibs.sh
+RUN chmod +x /tmp/generate_typelibs.sh && /tmp/generate_typelibs.sh || true
+
 # Install built plugin libs into a staging directory
 RUN mkdir -p /staging/usr/local/lib/gstreamer-1.0 \
  && find target/release -name "libgstrswebrtc.so" -exec cp {} /staging/usr/local/lib/gstreamer-1.0/ \; \
  && find target/release -name "libgstndi.so" -exec cp {} /staging/usr/local/lib/gstreamer-1.0/ \; || true
+
+# Ensure staging typelib dir exists (script may have written here)
+RUN mkdir -p /staging/usr/local/lib/girepository-1.0 || true
 
 # Final image
 FROM ubuntu:24.04
@@ -84,6 +96,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG GST_PLUGINS_RS_REV
 ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
 ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV GI_TYPELIB_PATH=/usr/local/lib/girepository-1.0
 
 # Runtime packages
 RUN apt-get update \
@@ -112,6 +125,7 @@ RUN apt-get update \
 
 # Copy prebuilt plugins from builder stage
 COPY --from=builder /staging/usr/local/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
+COPY --from=builder /staging/usr/local/lib/girepository-1.0/ /usr/local/lib/girepository-1.0/
 
 # Copy plugin verification script and run it to ensure elements registered
 COPY scripts/check_gst_plugins.sh /usr/local/bin/check_gst_plugins.sh
