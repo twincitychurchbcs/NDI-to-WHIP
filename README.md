@@ -67,15 +67,15 @@ ndisrc ──► ndisrcdemux
 
 ## Requirements
 
-| Component | Minimum version | Notes |
-|---|---|---|
-| Ubuntu | 22.04 LTS | 24.04 preferred (ships GStreamer 1.24) |
-| GStreamer | 1.20 | 1.24 recommended; must match gst-plugins-rs tag |
-| Rust / Cargo | stable | Build-time only |
-| NDI SDK | v5 or v6 | Proprietary — download from ndi.tv |
-| Python | 3.10 | 3.11+ gets `tomllib` without extra install |
-| libnice | any | Ships with Ubuntu — ICE for WebRTC |
-| libsrtp2 | any | Ships with Ubuntu — SRTP |
+| Component    | Minimum version | Notes                                           |
+| ------------ | --------------- | ----------------------------------------------- |
+| Ubuntu       | 22.04 LTS       | 24.04 preferred (ships GStreamer 1.24)          |
+| GStreamer    | 1.20            | 1.24 recommended; must match gst-plugins-rs tag |
+| Rust / Cargo | stable          | Build-time only                                 |
+| NDI SDK      | v5 or v6        | Proprietary — download from ndi.tv              |
+| Python       | 3.10            | 3.11+ gets `tomllib` without extra install      |
+| libnice      | any             | Ships with Ubuntu — ICE for WebRTC              |
+| libsrtp2     | any             | Ships with Ubuntu — SRTP                        |
 
 ---
 
@@ -188,6 +188,7 @@ sudo ldconfig
 > **Important:** The file is `libgstrswebrtc.so` (with `rs`), not `libgstwebrtc.so`.
 > The Ubuntu package `gstreamer1.0-plugins-bad` ships `libgstwebrtc.so` which provides
 > `webrtcbin` but **not** `whipclientsink`. Always set:
+>
 > ```bash
 > export GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
 > ```
@@ -318,6 +319,9 @@ Restart after any change: `sudo systemctl restart ndi-to-whip`
 ```toml
 [ndi]
 source_name = "MYCOMPUTER (Stream 1)"   # exact NDI source name
+# Optional: a backup NDI source to fall back to if the primary cannot be
+# found or stops broadcasting. Leave empty ("") to disable.
+backup_source_name = ""
 
 [whip]
 url         = "http://127.0.0.1:8889/live/whip"
@@ -339,12 +343,12 @@ bitrate_bps = 128000
 
 ### WHIP endpoint examples
 
-| Service | URL format |
-|---|---|
-| MediaMTX (local) | `http://127.0.0.1:8889/live/whip` |
+| Service           | URL format                                                               |
+| ----------------- | ------------------------------------------------------------------------ |
+| MediaMTX (local)  | `http://127.0.0.1:8889/live/whip`                                        |
 | Cloudflare Stream | `https://customer-<id>.cloudflarestream.com/<stream-key>/webRTC/publish` |
-| LiveKit | `https://your-livekit-host/whip` |
-| Janus (local) | `http://127.0.0.1:8088/janus/whip` |
+| LiveKit           | `https://your-livekit-host/whip`                                         |
+| Janus (local)     | `http://127.0.0.1:8088/janus/whip`                                       |
 
 ---
 
@@ -371,6 +375,7 @@ export LD_LIBRARY_PATH=/usr/local/lib
 # Run with inline overrides (no config file needed)
 /opt/ndi_to_whip/venv/bin/python /opt/ndi_to_whip/ndi_to_whip.py \
   --ndi-source "MYPC (Camera 1)" \
+  --backup-ndi-source "MYPC (Camera 2)" \
   --whip-url "http://127.0.0.1:8889/live/whip" \
   --width 1280 --height 720 --framerate 30 \
   --log-level DEBUG
@@ -380,7 +385,7 @@ Stop with `Ctrl+C` — triggers a clean SIGINT shutdown.
 
 ### As a systemd service
 
-```bash
+````bash
 # Enable and start (also starts on every boot)
 sudo systemctl enable --now ndi-to-whip
 
@@ -390,14 +395,49 @@ sudo systemctl status ndi-to-whip
 # Follow live logs
 sudo journalctl -u ndi-to-whip -f
 
+## Docker
+
+This repository includes a Dockerfile that builds the necessary gst-plugins-rs
+plugins (NDI + WebRTC) and packages the Python application. The build will
+download and install the NDI SDK during the image build (the Dockerfile accepts
+the NDI EULA non-interactively). If you prefer not to bake the proprietary
+SDK into the image, mount your host's `/usr/local` at runtime instead.
+
+Build the image:
+
+```bash
+docker build -t ndi-to-whip:latest .
+````
+
+Run (recommended: bind your host `/usr/local` if it contains the NDI SDK):
+
+```bash
+docker run --rm \
+  -v /etc/ndi_to_whip/config.toml:/etc/ndi_to_whip/config.toml:ro \
+  -v /usr/local:/usr/local:ro \
+  ndi-to-whip:latest
+```
+
+Notes:
+
+- The Dockerfile downloads the NDI SDK and accepts the EULA via `yes y`.
+- To avoid embedding the SDK, remove the NDI install steps from the Dockerfile
+  and mount your host `/usr/local` (or provide the SDK via a build-arg).
+- If you need GPU-accelerated encoders (vaapi/nvenc), ensure the container has
+  access to the appropriate device nodes and drivers from the host.
+
 # Restart after config changes
+
 sudo systemctl restart ndi-to-whip
 
 # Stop
+
 sudo systemctl stop ndi-to-whip
 
 # View last 200 log lines
+
 sudo journalctl -u ndi-to-whip -n 200 --no-pager
+
 ```
 
 ---
@@ -409,13 +449,17 @@ When using MediaMTX as the WHIP server, the stream is available on multiple prot
 ### WebRTC (lowest latency, ~0.5s)
 
 Open in a browser:
+
 ```
+
 http://<server-ip>:8889/live/
-```
+
+````
 
 > **Note:** WebRTC playback requires ICE to succeed. If the browser and server are
 > on different subnets or behind NAT, ICE may fail. Add `webrtcLocalUDPAddress`
 > to `/etc/mediamtx/mediamtx.yml` to help:
+>
 > ```yaml
 > webrtcLocalUDPAddress: <server-ip>:8189
 > ```
@@ -423,13 +467,19 @@ http://<server-ip>:8889/live/
 ### HLS (~5–10s latency)
 
 Open in a browser or media player:
-```
+
+````
+
 http://<server-ip>:8888/live/
+
 ```
 
 Direct playlist URL:
+
 ```
+
 http://<server-ip>:8888/live/index.m3u8
+
 ```
 
 > **Safari / iOS note:** Safari does not support Opus audio in HLS. The HLS stream
@@ -441,17 +491,21 @@ http://<server-ip>:8888/live/index.m3u8
 1. Install **VLC** from the App Store or Google Play
 2. Tap the network/stream icon → **Open Network Stream**
 3. Enter:
-   ```
-   http://<server-ip>:8888/live/index.m3u8
-   ```
+```
+
+http://<server-ip>:8888/live/index.m3u8
+
+```
 
 VLC supports Opus audio and plays the HLS stream reliably on all platforms.
 
 ### RTSP
 
 ```
+
 rtsp://<server-ip>:8554/live
-```
+
+````
 
 ---
 
@@ -465,7 +519,7 @@ sudo bash validate.sh
 
 # Skip the 5-second NDI network scan
 bash validate.sh --quick
-```
+````
 
 ### Validate GStreamer elements only
 
@@ -529,6 +583,7 @@ sudo ip route add 224.0.0.0/4 dev eth0
 
 NDI discovery fails across VLANs unless multicast is routed. If your NDI sender
 is on a different VLAN, specify its IP directly in `source_name`:
+
 ```toml
 source_name = "192.168.1.50 (Stream Name)"
 ```
@@ -606,6 +661,7 @@ webrtcLocalUDPAddress: <server-ip>:8189
 ```
 
 Then open firewall port `8189/udp` if using ufw:
+
 ```bash
 sudo ufw allow 8189/udp
 ```
@@ -635,6 +691,7 @@ sudo journalctl -u ndi-to-whip -n 50 --no-pager | grep -E "error|WARN|Failed"
 ```
 
 Common causes:
+
 - NDI source name is wrong — run `--probe` to get the exact name
 - WHIP URL is unreachable — `curl -v YOUR_WHIP_URL`
 - `config.toml` syntax error — test with:
@@ -683,16 +740,16 @@ GST_DEBUG=GstBaseWebRTCSink:5 sudo journalctl -u ndi-to-whip -f
 
 ## Known Limitations
 
-| Limitation | Impact | Workaround |
-|---|---|---|
-| NDI SDK is proprietary | Manual install required | Script fails clearly and prints the download URL |
-| `gst-plugins-rs` requires Rust build | No Ubuntu package; 5–15 min build | Build once, pin the git tag |
-| gst-plugins-rs API changed in 1.24 | `sig-server-url`, `ndidemux`, pre-encoded input all removed | Use `signaller::whip-endpoint`, `ndisrcdemux`, raw A/V input |
-| `GstBaseWebRTCSink` controls encoding | `encoder` and `bitrate_kbps` config fields are hints; actual bitrate is WebRTC-negotiated | Set `video-caps="video/x-h264"` to constrain codec selection |
-| Safari iOS rejects Opus in HLS | HLS broken play button on iPhone/iPad | Use VLC, or the WebRTC player at `:8889` |
-| WebRTC ICE may fail across subnets | Viewer can't connect | Set `webrtcLocalUDPAddress` in mediamtx.yml |
-| WHIP ICE without TURN fails behind symmetric NAT | No media after signalling | Add TURN server to `[whip] turn_server` |
-| NDI SDK licence restricts redistribution | Cannot package `libndi.so` in a .deb | Automate install post-SDK-download only |
+| Limitation                                       | Impact                                                                                    | Workaround                                                   |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| NDI SDK is proprietary                           | Manual install required                                                                   | Script fails clearly and prints the download URL             |
+| `gst-plugins-rs` requires Rust build             | No Ubuntu package; 5–15 min build                                                         | Build once, pin the git tag                                  |
+| gst-plugins-rs API changed in 1.24               | `sig-server-url`, `ndidemux`, pre-encoded input all removed                               | Use `signaller::whip-endpoint`, `ndisrcdemux`, raw A/V input |
+| `GstBaseWebRTCSink` controls encoding            | `encoder` and `bitrate_kbps` config fields are hints; actual bitrate is WebRTC-negotiated | Set `video-caps="video/x-h264"` to constrain codec selection |
+| Safari iOS rejects Opus in HLS                   | HLS broken play button on iPhone/iPad                                                     | Use VLC, or the WebRTC player at `:8889`                     |
+| WebRTC ICE may fail across subnets               | Viewer can't connect                                                                      | Set `webrtcLocalUDPAddress` in mediamtx.yml                  |
+| WHIP ICE without TURN fails behind symmetric NAT | No media after signalling                                                                 | Add TURN server to `[whip] turn_server`                      |
+| NDI SDK licence restricts redistribution         | Cannot package `libndi.so` in a .deb                                                      | Automate install post-SDK-download only                      |
 
 ---
 
