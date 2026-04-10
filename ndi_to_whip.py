@@ -82,6 +82,7 @@ except ImportError:
 class Config:
     # NDI source
     ndi_source_name: str          = "MYCOMPUTER (Stream 1)"
+    backup_ndi_source_name: str   = ""      # optional fallback NDI source name
     ndi_connect_timeout_ms: int   = 15000   # ms to wait for NDI source on startup
 
     # WHIP endpoint
@@ -148,6 +149,7 @@ def load_config(config_path: Optional[str], overrides: dict) -> Config:
 
                 _apply("ndi",    {
                     "source_name":        "ndi_source_name",
+                    "backup_source_name": "backup_ndi_source_name",
                     "connect_timeout_ms": "ndi_connect_timeout_ms",
                 })
                 _apply("whip",   {
@@ -511,17 +513,40 @@ class NdiToWhipBridge:
 
         max_attempts = self.cfg.retry_max_attempts
 
-        while not self._stop_event.is_set():
-            try:
-                self._run_once()
-            except Exception as exc:
-                log.exception("pipeline_exception", exc=str(exc))
+        # Candidate NDI sources: primary first, then optional backup
+        candidates = [self.cfg.ndi_source_name]
+        if self.cfg.backup_ndi_source_name and self.cfg.backup_ndi_source_name not in candidates:
+            candidates.append(self.cfg.backup_ndi_source_name)
 
+        log.info("ndi_candidates", candidates=candidates)
+
+        # Loop: try each candidate in order, then wait/backoff before retrying
+        while not self._stop_event.is_set():
+            for src in candidates:
+                if self._stop_event.is_set():
+                    break
+
+                # Set the active source for this attempt
+                self.cfg.ndi_source_name = src
+                try:
+                    self._run_once()
+                except Exception as exc:
+                    log.exception("pipeline_exception", exc=str(exc))
+
+                if self._stop_event.is_set():
+                    break
+
+                if max_attempts and self._attempt >= max_attempts:
+                    log.error("retry_limit_reached", attempts=self._attempt)
+                    self._stop_event.set()
+                    break
+
+                # If we have more candidates to try immediately, continue to next
+                # Otherwise, we've exhausted candidates for this cycle and will backoff
             if self._stop_event.is_set():
                 break
 
             if max_attempts and self._attempt >= max_attempts:
-                log.error("retry_limit_reached", attempts=self._attempt)
                 break
 
             delay = self._reconnect_delay()
@@ -562,6 +587,8 @@ def parse_args() -> argparse.Namespace:
     # Overrides (all optional — TOML file takes precedence if not given)
     g = p.add_argument_group("overrides (take precedence over config file)")
     g.add_argument("--ndi-source",      metavar="NAME",  dest="ndi_source_name")
+    g.add_argument("--backup-ndi-source", metavar="NAME", dest="backup_ndi_source_name",
+                   help="Optional backup NDI source name if primary is unavailable")
     g.add_argument("--whip-url",        metavar="URL",   dest="whip_url")
     g.add_argument("--auth-token",      metavar="TOKEN", dest="auth_token")
     g.add_argument("--width",           type=int,        dest="video_width")

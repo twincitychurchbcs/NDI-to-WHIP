@@ -15,6 +15,10 @@
 #   "192.168.1.50 (NDI Source)"
 source_name = "MYCOMPUTER (Stream 1)"
 
+# Optional backup NDI source to use if the primary cannot be found or stops
+# broadcasting. Leave empty ("") to disable.
+backup_source_name = ""
+
 # Milliseconds to wait for the NDI source to appear on startup.
 # Increase for sources that take longer to register on the network.
 connect_timeout_ms = 15000
