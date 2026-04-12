@@ -235,7 +235,8 @@ ENCODER_PROFILES = {
 }
 
 
-def build_pipeline_string(cfg: Config) -> str:
+def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
+                          demux_audio_pad: str = "demux.audio") -> str:
     """
     Build the GStreamer pipeline string.
 
@@ -295,7 +296,7 @@ def build_pipeline_string(cfg: Config) -> str:
             do-timestamp=true
         ! ndisrcdemux name=demux
 
-        demux.video
+        {demux_video_pad}
         ! queue name=vqueue
             leaky=downstream
             max-size-buffers=5
@@ -307,7 +308,7 @@ def build_pipeline_string(cfg: Config) -> str:
         ! {video_caps}
         ! whip.
 
-        demux.audio
+        {demux_audio_pad}
         ! queue name=aqueue
             leaky=downstream
             max-size-buffers=10
@@ -355,6 +356,48 @@ def probe_ndi_sources(timeout_s: float = 5.0) -> list[str]:
     return sources
 
 
+def _discover_demux_src_pad_names() -> tuple[str, str]:
+    """
+    Inspect the `ndisrcdemux` element factory and return a pair of pad-name
+    strings suitable for use in the pipeline string. Tries to find template
+    names containing 'video' and 'audio' and falls back to the first two
+    src pad templates if those aren't present.
+    """
+    factory = Gst.ElementFactory.find("ndisrcdemux")
+    if not factory:
+        return ("demux.video", "demux.audio")
+
+    video_name = None
+    audio_name = None
+    src_names: list[str] = []
+    for tmpl in factory.get_static_pad_templates():
+        if tmpl.get_direction() != Gst.PadDirection.SRC:
+            continue
+        # name_template may be like "video" or "src_%u" depending on build
+        try:
+            name_template = tmpl.get_name_template()
+        except Exception:
+            # Older APIs may differ; fall back to repr
+            name_template = str(tmpl.get_name())
+        if "video" in name_template and video_name is None:
+            video_name = f"demux.{name_template}"
+        if "audio" in name_template and audio_name is None:
+            audio_name = f"demux.{name_template}"
+        src_names.append(name_template)
+
+    # Fallbacks
+    if video_name is None and src_names:
+        video_name = f"demux.{src_names[0]}"
+    if audio_name is None and len(src_names) > 1:
+        audio_name = f"demux.{src_names[1]}"
+    if audio_name is None:
+        audio_name = "demux.audio"
+    if video_name is None:
+        video_name = "demux.video"
+
+    return (video_name, audio_name)
+
+
 # =============================================================================
 # BRIDGE CLASS
 # =============================================================================
@@ -376,16 +419,26 @@ class NdiToWhipBridge:
     # ── Pipeline construction ─────────────────────────────────────────────────
 
     def _create_pipeline(self) -> Gst.Pipeline:
-        pipeline_str = build_pipeline_string(self.cfg)
+        # Discover demux pad names for this build of gst-plugins-rs and
+        # generate a pipeline string that matches the element's pad templates.
+        demux_video_pad, demux_audio_pad = _discover_demux_src_pad_names()
+        pipeline_str = build_pipeline_string(self.cfg, demux_video_pad, demux_audio_pad)
         log.debug("pipeline_string", pipeline=pipeline_str)
 
         try:
             pipeline = Gst.parse_launch(pipeline_str)
         except GLib.Error as exc:
-            raise RuntimeError(
-                f"Failed to parse GStreamer pipeline: {exc}\n"
-                "Hint: run with --print-pipeline and test manually with gst-launch-1.0"
-            ) from exc
+            # If parse_launch fails, attempt a second try with conservative
+            # fallback pad names (demux.video/demux.audio) so older plugin
+            # variants that use the conventional names still work.
+            log.warning("pipeline_parse_failed", error=str(exc), hint="Retrying with fallback demux pad names")
+            try:
+                pipeline = Gst.parse_launch(build_pipeline_string(self.cfg, "demux.video", "demux.audio"))
+            except GLib.Error as exc2:
+                raise RuntimeError(
+                    f"Failed to parse GStreamer pipeline: {exc2}\n"
+                    "Hint: run with --print-pipeline and test manually with gst-launch-1.0"
+                ) from exc2
 
         if not isinstance(pipeline, Gst.Pipeline):
             pipeline = Gst.Pipeline.new("ndi_to_whip")
