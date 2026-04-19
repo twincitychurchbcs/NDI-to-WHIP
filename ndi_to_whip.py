@@ -371,14 +371,27 @@ def _discover_demux_src_pad_names() -> tuple[str, str]:
     audio_name = None
     src_names: list[str] = []
     for tmpl in factory.get_static_pad_templates():
-        if tmpl.get_direction() != Gst.PadDirection.SRC:
+        # Some Gst versions expose direction via method, others via attribute.
+        dir_getter = getattr(tmpl, "get_direction", None)
+        try:
+            if callable(dir_getter):
+                direction = dir_getter()
+            else:
+                direction = getattr(tmpl, "direction", None)
+        except Exception:
+            direction = None
+
+        if direction is not None and direction != Gst.PadDirection.SRC:
             continue
+
         # name_template may be like "video" or "src_%u" depending on build
         try:
             name_template = tmpl.get_name_template()
         except Exception:
-            # Older APIs may differ; fall back to repr
-            name_template = str(tmpl.get_name())
+            try:
+                name_template = str(tmpl.get_name())
+            except Exception:
+                name_template = str(tmpl)
         if "video" in name_template and video_name is None:
             video_name = f"demux.{name_template}"
         if "audio" in name_template and audio_name is None:
