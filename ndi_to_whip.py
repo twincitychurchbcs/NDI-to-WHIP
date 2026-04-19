@@ -519,6 +519,94 @@ class NdiToWhipBridge:
         self.loop = GLib.MainLoop()
         self.loop.run()
 
+    def _try_establish_source(self, src: str, attempt_timeout_s: float = 5.0) -> bool:
+        """
+        Try to create and start a temporary pipeline for `src` to verify that a
+        connection to that NDI source can be established. Returns True if the
+        temporary pipeline reached PLAYING within `attempt_timeout_s` seconds.
+        This does not modify the bridge's active pipeline/state.
+        """
+        # Preserve current cfg values
+        old_source = self.cfg.ndi_source_name
+        old_timeout = self.cfg.ndi_connect_timeout_ms
+        try:
+            self.cfg.ndi_source_name = src
+            self.cfg.ndi_connect_timeout_ms = int(attempt_timeout_s * 1000)
+            try:
+                pipeline = self._create_pipeline()
+            except Exception:
+                return False
+
+            # Try to start the temporary pipeline and wait for state
+            ret = pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                pipeline.set_state(Gst.State.NULL)
+                return False
+
+            # Wait up to attempt_timeout_s for the pipeline to reach PLAYING
+            # get_state expects microseconds
+            try:
+                state_change = pipeline.get_state(int(attempt_timeout_s * Gst.SECOND))
+            except Exception:
+                state_change = (None, None, None)
+
+            # state_change may be (return, pending, state)
+            is_playing = False
+            try:
+                if len(state_change) >= 3 and state_change[2] == Gst.State.PLAYING:
+                    is_playing = True
+            except Exception:
+                is_playing = False
+
+            pipeline.set_state(Gst.State.NULL)
+            return is_playing
+        finally:
+            self.cfg.ndi_source_name = old_source
+            self.cfg.ndi_connect_timeout_ms = old_timeout
+
+    def _start_primary_poll(self, primary: str, poll_interval_s: float = 10.0) -> threading.Thread:
+        """
+        Start a background thread that polls for `primary` every `poll_interval_s`.
+        When a usable primary is detected (verified by `_try_establish_source`),
+        it triggers `_schedule_reconnect()` so the main loop will switch to it.
+        Returns the Thread object.
+        """
+        stop_evt = self._stop_event
+
+        def _poller():
+            log.info("primary_poller_started", primary=primary, interval_s=poll_interval_s)
+            while not stop_evt.is_set():
+                # Short-circuit: if bridge not currently running a pipeline, stop
+                if not self.pipeline:
+                    break
+
+                try:
+                    # Quick probe to avoid expensive connect attempts
+                    sources = probe_ndi_sources(timeout_s=2.0)
+                    if primary in sources:
+                        log.info("primary_seen", primary=primary)
+                        # Verify we can actually establish a connection
+                        ok = self._try_establish_source(primary, attempt_timeout_s=5.0)
+                        if ok:
+                            log.info("primary_verified", primary=primary)
+                            # Request switching to primary
+                            self.cfg.ndi_source_name = primary
+                            self._schedule_reconnect()
+                            break
+                        else:
+                            log.info("primary_verify_failed", primary=primary)
+                except Exception as exc:
+                    log.warning("primary_poller_error", exc=str(exc))
+
+                # Wait for next poll or stop
+                stop_evt.wait(timeout=poll_interval_s)
+
+            log.info("primary_poller_exiting", primary=primary)
+
+        t = threading.Thread(target=_poller, daemon=True)
+        t.start()
+        return t
+
     # ── Single pipeline run ───────────────────────────────────────────────────
 
     def _run_once(self) -> None:
@@ -573,14 +661,25 @@ class NdiToWhipBridge:
 
         log.info("ndi_candidates", candidates=candidates)
 
-        # Loop: try each candidate in order, then wait/backoff before retrying
+        # Loop: prefer primary; if primary unavailable, run backup but poll
+        # every 10s for primary and only switch after verifying a primary
+        # connection can be established.
         while not self._stop_event.is_set():
-            for src in candidates:
-                if self._stop_event.is_set():
-                    break
+            primary = candidates[0]
+            backup = candidates[1] if len(candidates) > 1 else None
 
-                # Set the active source for this attempt
-                self.cfg.ndi_source_name = src
+            # First, try primary
+            try_primary_now = False
+            try:
+                sources = probe_ndi_sources(timeout_s=2.0)
+                if primary in sources:
+                    try_primary_now = True
+            except Exception:
+                # If probing fails, fall back to attempting to connect
+                try_primary_now = True
+
+            if try_primary_now:
+                self.cfg.ndi_source_name = primary
                 try:
                     self._run_once()
                 except Exception as exc:
@@ -594,8 +693,37 @@ class NdiToWhipBridge:
                     self._stop_event.set()
                     break
 
-                # If we have more candidates to try immediately, continue to next
-                # Otherwise, we've exhausted candidates for this cycle and will backoff
+                # If primary failed, fallthrough to backup logic / backoff
+
+            # If primary not available and we have a backup, run it and poll
+            if backup and not self._stop_event.is_set():
+                log.info("using_backup", backup=backup)
+                self.cfg.ndi_source_name = backup
+                poll_thread = self._start_primary_poll(primary, poll_interval_s=10.0)
+                try:
+                    try:
+                        self._run_once()
+                    except Exception as exc:
+                        log.exception("pipeline_exception", exc=str(exc))
+                finally:
+                    # Ensure poll thread exits promptly
+                    try:
+                        if poll_thread.is_alive():
+                            # Poller observes self.pipeline and _stop_event; wake it
+                            self._stop_event.wait(timeout=0.01)
+                            poll_thread.join(timeout=1.0)
+                    except Exception:
+                        pass
+
+                if self._stop_event.is_set():
+                    break
+
+                if max_attempts and self._attempt >= max_attempts:
+                    log.error("retry_limit_reached", attempts=self._attempt)
+                    self._stop_event.set()
+                    break
+
+            # No candidates connected this cycle — backoff before retrying
             if self._stop_event.is_set():
                 break
 
