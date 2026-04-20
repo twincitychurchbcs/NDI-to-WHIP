@@ -81,6 +81,16 @@ RUN git clone --branch ${GST_PLUGINS_RS_REV} --depth 1 https://gitlab.freedeskto
 WORKDIR /tmp/gst-plugins-rs
 RUN cargo build --release --package gst-plugin-ndi --package gst-plugin-webrtc
 
+# Build gst-plugins-bad from source into the staging area. Some RTP
+# congestion-control elements (rtpgccbwe) may not be present in the
+# distro packages; building gst-plugins-bad ensures those elements exist.
+RUN git clone --branch ${GST_PLUGINS_RS_REV} --depth 1 https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad.git /tmp/gst-plugins-bad \
+ && cd /tmp/gst-plugins-bad \
+ && meson setup build --prefix=/usr/local || true \
+ && ninja -C build || true \
+ && DESTDIR=/staging ninja -C build install || true \
+ && rm -rf /tmp/gst-plugins-bad || true
+
 # Attempt to generate GIR/typelib files for Python introspection consumers.
 # This is best-effort: the script will try multiple likely namespace names
 # and write .typelib files into /staging/usr/local/lib/girepository-1.0
