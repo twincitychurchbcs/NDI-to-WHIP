@@ -589,9 +589,16 @@ class NdiToWhipBridge:
         def _poller():
             log.info("primary_poller_started", primary=primary, interval_s=poll_interval_s)
             while not stop_evt.is_set():
-                # Short-circuit: if bridge not currently running a pipeline, stop
+                # Wait for the bridge's pipeline to be created before polling.
+                # The poller may start slightly before the main thread creates
+                # the pipeline; in that case, wait a short time rather than
+                # exiting immediately.
                 if not self.pipeline:
-                    break
+                    # Wake periodically to check for stop event or pipeline.
+                    stop_evt.wait(timeout=0.1)
+                    # If still no pipeline, continue the loop rather than exit.
+                    if not self.pipeline:
+                        continue
 
                 try:
                     # Quick probe to avoid expensive connect attempts
