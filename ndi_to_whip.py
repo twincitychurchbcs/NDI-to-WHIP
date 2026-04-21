@@ -501,10 +501,25 @@ class NdiToWhipBridge:
         elif t == Gst.MessageType.ELEMENT:
             structure = msg.get_structure()
             if structure:
-                name = structure.get_name()
-                # WHIP signalling events emitted by whipclientsink
-                if name in ("whip-connected", "whip-error", "whip-disconnected"):
-                    log.info("whip_event", event=name, detail=structure.to_string())
+                    name = structure.get_name()
+                    # WHIP signalling events emitted by whipclientsink
+                    if name == "whip-connected":
+                        log.info("whip_event", event=name, detail=structure.to_string())
+                    elif name == "whip-error":
+                        log.error("whip_event", event=name, detail=structure.to_string())
+                        # Always attempt to reconnect on WHIP error
+                        try:
+                            self._schedule_reconnect()
+                        except Exception:
+                            # Ensure bus handler doesn't raise
+                            log.exception("whip_reconnect_failed")
+                    elif name == "whip-disconnected":
+                        log.info("whip_event", event=name, detail=structure.to_string())
+                        # Reconnect on disconnect as well
+                        try:
+                            self._schedule_reconnect()
+                        except Exception:
+                            log.exception("whip_reconnect_failed")
 
         return True  # keep watching
 
