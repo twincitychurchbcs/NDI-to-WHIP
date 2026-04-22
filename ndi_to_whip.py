@@ -616,8 +616,10 @@ class NdiToWhipBridge:
                         continue
 
                 try:
+                    log.debug("begin_probe", primary=primary    )
                     # Quick probe to avoid expensive connect attempts
                     sources = probe_ndi_sources(timeout_s=2.0)
+                    log.debug("probe_results", sources=sources)
                     if primary in sources:
                         log.info("primary_seen", primary=primary)
                         # Verify we can actually establish a connection
@@ -632,7 +634,7 @@ class NdiToWhipBridge:
                             log.info("primary_verify_failed", primary=primary)
                 except Exception as exc:
                     log.warning("primary_poller_error", exc=str(exc))
-
+                log.debug("end_probe")
                 # Wait for next poll or stop
                 stop_evt.wait(timeout=poll_interval_s)
 
