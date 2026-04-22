@@ -50,7 +50,6 @@ try:
 except Exception as exc:
     sys.exit(f"[FATAL] GStreamer Python bindings not available: {exc}")
 
-Gst.init(None)
 
 # ── Structured logging ────────────────────────────────────────────────────────
 try:
@@ -860,6 +859,13 @@ def main() -> None:
                           "/usr/local/lib/gstreamer-1.0")
     os.environ.setdefault("LD_LIBRARY_PATH",
                           "/usr/local/lib:" + os.environ.get("LD_LIBRARY_PATH", ""))
+
+    # Initialize GStreamer after environment variables are set so custom
+    # plugins (gst-plugins-rs builds) in GST_PLUGIN_PATH are discoverable.
+    try:
+        Gst.init(None)
+    except Exception as exc:
+        sys.exit(f"[FATAL] Failed to initialize GStreamer: {exc}")
 
     # Configure Python log level
     level = getattr(logging, cfg.log_level.upper(), logging.INFO)
