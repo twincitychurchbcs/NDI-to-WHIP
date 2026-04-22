@@ -618,7 +618,7 @@ class NdiToWhipBridge:
                 try:
                     log.debug("begin_probe", primary=primary    )
                     # Quick probe to avoid expensive connect attempts
-                    sources = probe_ndi_sources(timeout_s=2.0)
+                    sources = probe_ndi_sources(timeout_s=5.0)
                     log.debug("probe_results", sources=sources)
                     if primary in sources:
                         log.info("primary_seen", primary=primary)
