@@ -881,6 +881,7 @@ def main() -> None:
     if args.probe:
         print(f"Probing for NDI sources ({args.probe_timeout}s)…")
         sources = probe_ndi_sources(timeout_s=args.probe_timeout)
+        log.debug("probe_results", sources=sources)
         if sources:
             print(f"\nFound {len(sources)} NDI source(s):")
             for s in sources:
