@@ -591,7 +591,7 @@ class NdiToWhipBridge:
             self.cfg.ndi_source_name = old_source
             self.cfg.ndi_connect_timeout_ms = old_timeout
 
-    def _start_primary_poll(self, primary: str, poll_interval_s: float = 10.0) -> threading.Thread:
+    def _start_primary_poll(self, primary: str, poll_interval_s: float = 20.0) -> threading.Thread:
         """
         Start a background thread that polls for `primary` every `poll_interval_s`.
         When a usable primary is detected (verified by `_try_establish_source`),
@@ -617,7 +617,7 @@ class NdiToWhipBridge:
                 try:
                     log.debug("begin_probe", primary=primary    )
                     # Quick probe to avoid expensive connect attempts
-                    sources = probe_ndi_sources(timeout_s=5.0)
+                    sources = probe_ndi_sources(timeout_s=15.0)
                     log.debug("probe_results", sources=sources)
                     if primary in sources:
                         log.info("primary_seen", primary=primary)
@@ -708,6 +708,7 @@ class NdiToWhipBridge:
             try_primary_now = False
             try:
                 sources = probe_ndi_sources(timeout_s=2.0)
+                log.debug("initial_probe_results", sources=sources)
                 if primary in sources:
                     try_primary_now = True
             except Exception:
