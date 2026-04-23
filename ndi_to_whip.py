@@ -327,44 +327,31 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
 # NDI SOURCE PROBE
 # =============================================================================
 
+# Long-lived ndideviceprovider instance for reliable repeated probing.
+_NDI_PROBE_CTX: Optional[GLib.MainContext] = None
+_NDI_DEVICE_PROVIDER: Optional[Gst.DeviceProvider] = None
+
 
 def _pump_glib_for(timeout_s: float, ctx: Optional[GLib.MainContext] = None) -> None:
-    """Pump a GLib main context for `timeout_s` seconds.
-
-    Some GStreamer device providers (including ndideviceprovider) rely on GLib
-    main-context dispatch to deliver discovery events. Using time.sleep() does
-    not dispatch those events and can lead to intermittent/empty discovery.
-
-    If `ctx` is provided, we pump that context; otherwise we create a private
-    context.
-
-    Implementation note:
-      Avoid relying on GLib.timeout_add(..., context=ctx) because some GI
-      bindings/builds may ignore the context kwarg; that can cause the loop to
-      never receive the timeout and hang indefinitely.
-
-      Instead we create a timeout source and explicitly attach it to `ctx`.
-    """
+    """Pump a GLib main context for `timeout_s` seconds."""
     timeout_ms = max(0, int(timeout_s * 1000))
 
     ctx = ctx or GLib.MainContext.new()
     loop = GLib.MainLoop.new(ctx, False)
 
-    def _quit_cb() -> bool:
+    def _quit_cb(*_args) -> bool:
         try:
             loop.quit()
         except Exception:
             pass
         return False
 
-    # Create a timeout source that is guaranteed to be attached to ctx.
     source = None
     try:
         source = GLib.timeout_source_new(timeout_ms)
         source.set_callback(_quit_cb)
         source.attach(ctx)
     except Exception:
-        # Fallback: at least try to schedule a quit on the default context.
         try:
             GLib.timeout_add(timeout_ms, lambda: _quit_cb())
         except Exception:
@@ -380,43 +367,79 @@ def _pump_glib_for(timeout_s: float, ctx: Optional[GLib.MainContext] = None) -> 
             pass
 
 
-def probe_ndi_sources(timeout_s: float = 5.0) -> list[str]:
-    """Enumerate visible NDI sources using the ndideviceprovider.
+def _get_ndi_device_provider() -> tuple[Optional[GLib.MainContext], Optional[Gst.DeviceProvider]]:
+    """Get or create a long-lived ndideviceprovider.
 
-    Returns a list of source display-name strings.
-
-    IMPORTANT: The device provider may post discovery to the *thread-default*
-    GLib main context. We therefore push a private context as thread-default for
-    the duration of the probe, and pump that same context.
+    Starting/stopping ndideviceprovider repeatedly can lead to subsequent
+    discovery returning empty. Keeping a single provider running is more
+    reliable.
     """
-    sources: list[str] = []
+    global _NDI_PROBE_CTX, _NDI_DEVICE_PROVIDER
+
+    if _NDI_PROBE_CTX is not None and _NDI_DEVICE_PROVIDER is not None:
+        return (_NDI_PROBE_CTX, _NDI_DEVICE_PROVIDER)
+
+    factory = Gst.DeviceProviderFactory.find("ndideviceprovider")
+    if factory is None:
+        log.error("probe_failed", reason="ndideviceprovider not available")
+        return (None, None)
+
+    ctx = GLib.MainContext.new()
+    ctx.push_thread_default()
+    try:
+        provider = factory.get()
+        provider.start()
+    except Exception as exc:
+        log.warning("probe_error", exc=str(exc))
+        try:
+            ctx.pop_thread_default()
+        except Exception:
+            pass
+        return (None, None)
+
+    _NDI_PROBE_CTX = ctx
+    _NDI_DEVICE_PROVIDER = provider
+    return (ctx, provider)
+
+
+def _shutdown_ndi_device_provider() -> None:
+    global _NDI_PROBE_CTX, _NDI_DEVICE_PROVIDER
+
+    provider = _NDI_DEVICE_PROVIDER
+    ctx = _NDI_PROBE_CTX
+
+    _NDI_DEVICE_PROVIDER = None
+    _NDI_PROBE_CTX = None
 
     try:
-        factory = Gst.DeviceProviderFactory.find("ndideviceprovider")
-        if factory is None:
-            log.error("probe_failed", reason="ndideviceprovider not available")
-            return sources
-
-        ctx = GLib.MainContext.new()
-        ctx.push_thread_default()
-        try:
-            provider = factory.get()
-            provider.start()
-
-            _pump_glib_for(timeout_s, ctx=ctx)
-
-            for device in provider.get_devices():
-                name = device.get_display_name()
-                if name:
-                    sources.append(name)
-
+        if provider is not None:
             provider.stop()
-        finally:
-            try:
-                ctx.pop_thread_default()
-            except Exception:
-                pass
+    except Exception:
+        pass
 
+    try:
+        if ctx is not None:
+            ctx.pop_thread_default()
+    except Exception:
+        pass
+
+
+def probe_ndi_sources(timeout_s: float = 5.0) -> list[str]:
+    """Enumerate visible NDI sources via GStreamer's ndideviceprovider."""
+    sources: list[str] = []
+
+    ctx, provider = _get_ndi_device_provider()
+    if ctx is None or provider is None:
+        return sources
+
+    # Pump GLib to allow discovery updates.
+    _pump_glib_for(timeout_s, ctx=ctx)
+
+    try:
+        for device in provider.get_devices():
+            name = device.get_display_name()
+            if name:
+                sources.append(name)
     except Exception as exc:
         log.warning("probe_error", exc=str(exc))
 
@@ -957,6 +980,8 @@ def main() -> None:
                 print(f"  • {s}")
         else:
             print("  No NDI sources found. Check network and NDI sender.")
+        # Cleanly stop provider when running in one-shot probe mode.
+        _shutdown_ndi_device_provider()
         sys.exit(0)
 
     if args.print_pipeline:
@@ -975,7 +1000,10 @@ def main() -> None:
     signal.signal(signal.SIGINT,  _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
-    bridge.run()
+    try:
+        bridge.run()
+    finally:
+        _shutdown_ndi_device_provider()
 
 
 if __name__ == "__main__":
