@@ -529,6 +529,9 @@ class NdiToWhipBridge:
         self._stop_event   = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
         self._attempt      = 0
+        # Set by the primary poller when it triggers a source switch so the
+        # main run() loop can skip the backoff delay and retry immediately.
+        self._source_switch_requested = threading.Event()
 
     # ── Pipeline construction ─────────────────────────────────────────────────
 
@@ -693,72 +696,62 @@ class NdiToWhipBridge:
             self.cfg.ndi_source_name = old_source
             self.cfg.ndi_connect_timeout_ms = old_timeout
 
-    def _start_primary_poll(self, primary: str, poll_interval_s: float = 20.0) -> threading.Thread:
+    def _start_primary_poll(
+        self, primary: str, poll_interval_s: float = 20.0
+    ) -> tuple[threading.Thread, threading.Event]:
         """
         Start a background thread that polls for `primary` every `poll_interval_s`.
-        When a usable primary is detected (verified by `_try_establish_source`),
-        it triggers `_schedule_reconnect()` so the main loop will switch to it.
-        Returns the Thread object.
+        When the primary NDI source is visible it sets `_source_switch_requested`,
+        updates `cfg.ndi_source_name`, and calls `_schedule_reconnect()` so the
+        main loop will restart the pipeline on the primary source immediately.
+
+        Returns ``(thread, poller_stop_event)``.  The caller should call
+        ``poller_stop_event.set()`` before ``thread.join()`` to wake and clean up
+        the poller without waiting for the full poll interval.
         """
         stop_evt = self._stop_event
+        # Per-poller stop event so the finally block can wake the thread promptly
+        # without flagging the entire bridge for shutdown.
+        poller_stop = threading.Event()
 
         def _poller():
             log.info("primary_poller_started", primary=primary, interval_s=poll_interval_s)
-            while not stop_evt.is_set():
-                # Wait for the bridge's pipeline to be created before polling.
-                # The poller may start slightly before the main thread creates
-                # the pipeline; in that case, wait a short time rather than
-                # exiting immediately.
+            while not stop_evt.is_set() and not poller_stop.is_set():
+                # Wait until an active pipeline exists before probing so that we
+                # don't fire at startup before _run_once() has created one.
                 if not self.pipeline:
-                    # Wake periodically to check for stop event or pipeline.
-                    stop_evt.wait(timeout=0.1)
-                    # If still no pipeline, continue the loop rather than exit.
+                    poller_stop.wait(timeout=0.1)
                     if not self.pipeline:
                         continue
 
                 try:
-                    log.debug("begin_probe", primary=primary    )
-                    # Quick probe to avoid expensive connect attempts
+                    log.debug("begin_probe", primary=primary)
                     sources = probe_ndi_sources(timeout_s=15.0)
                     log.debug("probe_results", sources=sources)
                     if primary in sources:
-                        log.info("primary_seen", primary=primary)
-                        # Verify we can actually establish a connection
-                        ok = self._try_establish_source(primary, attempt_timeout_s=5.0)
-                        if ok:
-                            log.info("primary_verified", primary=primary)
-                            # Request switching to primary
-                            self.cfg.ndi_source_name = primary
-                            self._schedule_reconnect()
-                            # Don't exit the poller thread — keep monitoring.
-                            # Wait for the main thread to tear down the old
-                            # pipeline and create a new one for the primary
-                            # before continuing probes. This avoids the
-                            # poller terminating after a single switch.
-                            try:
-                                # Wait until pipeline is recreated (or stop requested)
-                                while not stop_evt.is_set():
-                                    if self.pipeline:
-                                        break
-                                    stop_evt.wait(timeout=0.2)
-                            except Exception:
-                                pass
-                            # Continue polling after a short grace period
-                            stop_evt.wait(timeout=0.5)
-                            continue
-                        else:
-                            log.info("primary_verify_failed", primary=primary)
+                        log.info("primary_seen_switching", primary=primary)
+                        # NDI source is visible — request an immediate switch.
+                        # We do NOT call _try_establish_source here because
+                        # that would create a competing WHIP pipeline while the
+                        # backup stream is live, disrupting the current session.
+                        self.cfg.ndi_source_name = primary
+                        self._source_switch_requested.set()
+                        self._schedule_reconnect()
+                        # Poller's job is done.  run() will create a fresh
+                        # poller the next time backup is needed.
+                        break
                 except Exception as exc:
                     log.warning("primary_poller_error", exc=str(exc))
+
                 log.debug("end_probe")
-                # Wait for next poll or stop
-                stop_evt.wait(timeout=poll_interval_s)
+                # Interruptible sleep — woken early by poller_stop.set()
+                poller_stop.wait(timeout=poll_interval_s)
 
             log.info("primary_poller_exiting", primary=primary)
 
         t = threading.Thread(target=_poller, daemon=True)
         t.start()
-        return t
+        return t, poller_stop
 
     # ── Single pipeline run ───────────────────────────────────────────────────
 
@@ -853,19 +846,19 @@ class NdiToWhipBridge:
             if backup and not self._stop_event.is_set():
                 log.info("using_backup", backup=backup)
                 self.cfg.ndi_source_name = backup
-                poll_thread = self._start_primary_poll(primary, poll_interval_s=10.0)
+                poll_thread, poller_stop = self._start_primary_poll(primary, poll_interval_s=10.0)
                 try:
                     try:
                         self._run_once()
                     except Exception as exc:
                         log.exception("pipeline_exception", exc=str(exc))
                 finally:
-                    # Ensure poll thread exits promptly
+                    # Signal the poller to exit and join it cleanly.
+                    # Setting poller_stop wakes the thread from its sleep
+                    # immediately so we don't block for a full poll interval.
+                    poller_stop.set()
                     try:
-                        if poll_thread.is_alive():
-                            # Poller observes self.pipeline and _stop_event; wake it
-                            self._stop_event.wait(timeout=0.01)
-                            poll_thread.join(timeout=1.0)
+                        poll_thread.join(timeout=2.0)
                     except Exception:
                         pass
 
@@ -883,6 +876,14 @@ class NdiToWhipBridge:
 
             if max_attempts and self._attempt >= max_attempts:
                 break
+
+            # If the primary poller triggered a source switch, skip the backoff
+            # delay entirely and retry immediately so the WHIP stream restarts
+            # on the new source without waiting up to retry_max_delay_s seconds.
+            if self._source_switch_requested.is_set():
+                self._source_switch_requested.clear()
+                log.info("source_switch_immediate_retry", next_source=self.cfg.ndi_source_name)
+                continue
 
             delay = self._reconnect_delay()
             log.info("reconnect_waiting", delay_s=round(delay, 1), attempt=self._attempt)
