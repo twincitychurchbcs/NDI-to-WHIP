@@ -333,36 +333,47 @@ _NDI_DEVICE_PROVIDER: Optional[Gst.DeviceProvider] = None
 
 
 def _pump_glib_for(timeout_s: float, ctx: Optional[GLib.MainContext] = None) -> None:
-    """Pump a GLib main context for `timeout_s` seconds."""
-    timeout_ms = max(0, int(timeout_s * 1000))
+    """Pump a GLib main context for up to `timeout_s` seconds.
 
+    This implementation avoids running nested GLib.MainLoop instances (which can
+    be prone to deadlocks/hangs depending on GI/GLib ownership and signal
+    wakeups). Instead, it iterates the context directly.
+
+    NOTE: We must acquire the context while iterating.
+    """
     ctx = ctx or GLib.MainContext.new()
-    loop = GLib.MainLoop.new(ctx, False)
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
 
-    def _quit_cb(*_args) -> bool:
-        try:
-            loop.quit()
-        except Exception:
-            pass
-        return False
-
-    source = None
+    acquired = False
     try:
-        source = GLib.timeout_source_new(timeout_ms)
-        source.set_callback(_quit_cb)
-        source.attach(ctx)
-    except Exception:
-        try:
-            GLib.timeout_add(timeout_ms, lambda: _quit_cb())
-        except Exception:
-            pass
+        acquired = bool(ctx.acquire())
+        # If we can't acquire the context, do a bounded sleep so callers don't
+        # hang indefinitely.
+        if not acquired:
+            time.sleep(min(0.05, max(0.0, float(timeout_s))))
+            return
 
-    try:
-        loop.run()
+        # Drain/iterate until deadline.
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                break
+
+            # Process all currently pending events without blocking.
+            try:
+                while ctx.pending():
+                    ctx.iteration(False)
+            except Exception:
+                # If pending()/iteration() behaves oddly on a platform, keep the
+                # loop bounded.
+                pass
+
+            # Small sleep to avoid busy-looping; keep latency low.
+            time.sleep(0.01)
     finally:
         try:
-            if source is not None:
-                source.destroy()
+            if acquired:
+                ctx.release()
         except Exception:
             pass
 
