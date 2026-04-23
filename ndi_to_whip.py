@@ -342,43 +342,42 @@ def _pump_glib_for(timeout_s: float, ctx: Optional[GLib.MainContext] = None) -> 
       Avoid relying on GLib.timeout_add(..., context=ctx) because some GI
       bindings/builds may ignore the context kwarg; that can cause the loop to
       never receive the timeout and hang indefinitely.
+
+      Instead we create a timeout source and explicitly attach it to `ctx`.
     """
     timeout_ms = max(0, int(timeout_s * 1000))
 
     ctx = ctx or GLib.MainContext.new()
     loop = GLib.MainLoop.new(ctx, False)
 
-    def _quit() -> bool:
+    def _quit_cb() -> bool:
         try:
             loop.quit()
         except Exception:
             pass
         return False
 
-    def _install_timeout() -> None:
-        # Install the timeout while running on the desired context.
-        try:
-            GLib.timeout_add(timeout_ms, _quit)
-        except Exception:
-            # Worst-case fallback: quit soon-ish.
-            try:
-                GLib.timeout_add(0, _quit)
-            except Exception:
-                pass
-
-    # Ensure the timeout source is attached to `ctx` by scheduling the
-    # installation via ctx.invoke (runs in this context).
+    # Create a timeout source that is guaranteed to be attached to ctx.
+    source = None
     try:
-        # priority default is fine
-        ctx.invoke_full(GLib.PRIORITY_DEFAULT, _install_timeout)
+        source = GLib.timeout_source_new(timeout_ms)
+        source.set_callback(_quit_cb)
+        source.attach(ctx)
     except Exception:
-        # Fallback: try installing directly (may attach to default context)
-        _install_timeout()
+        # Fallback: at least try to schedule a quit on the default context.
+        try:
+            GLib.timeout_add(timeout_ms, lambda: _quit_cb())
+        except Exception:
+            pass
 
     try:
         loop.run()
-    except Exception:
-        return
+    finally:
+        try:
+            if source is not None:
+                source.destroy()
+        except Exception:
+            pass
 
 
 def probe_ndi_sources(timeout_s: float = 5.0) -> list[str]:
