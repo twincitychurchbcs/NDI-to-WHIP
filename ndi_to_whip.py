@@ -40,7 +40,7 @@ except ImportError:
     except ImportError:
         tomllib = None              # type: ignore[assignment]
 
-# ── GStreamer ─────────────────────────────────────────────────────────────────
+# ── GStreamer ────────────────────────────────────────────────────────────────
 try:
     import gi
     gi.require_version("Gst",    "1.0")
@@ -327,11 +327,47 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
 # NDI SOURCE PROBE
 # =============================================================================
 
-def probe_ndi_sources(timeout_s: float = 5.0) -> list[str]:
+
+def _pump_glib_for(timeout_s: float) -> None:
+    """Pump a private GLib main context for `timeout_s` seconds.
+
+    Some GStreamer device providers (including ndideviceprovider) rely on GLib
+    main-context dispatch to deliver discovery events. Using time.sleep() does
+    not dispatch those events and can lead to intermittent/empty discovery.
+
+    This helper runs a small GLib loop with its own context for a bounded time.
     """
-    Enumerate visible NDI sources using the ndideviceprovider GStreamer
-    device provider (available in gst-plugins-rs >= 1.24).
+    timeout_ms = max(0, int(timeout_s * 1000))
+
+    # Use a private context so we don't depend on a main thread default context.
+    ctx = GLib.MainContext.new()
+    loop = GLib.MainLoop.new(ctx, False)
+
+    def _quit() -> bool:
+        try:
+            loop.quit()
+        except Exception:
+            pass
+        return False  # do not repeat
+
+    GLib.timeout_add(timeout_ms, _quit, context=ctx)
+
+    try:
+        loop.run()
+    except Exception:
+        # If the loop fails for any reason, just return; probe will still try to
+        # read whatever devices are available.
+        return
+
+
+def probe_ndi_sources(timeout_s: float = 5.0) -> list[str]:
+    """Enumerate visible NDI sources via GStreamer's ndideviceprovider.
+
     Returns a list of source display-name strings.
+
+    NOTE: We intentionally pump a GLib main context for `timeout_s` rather than
+    using time.sleep(). On Linux with Avahi, this dramatically improves
+    reliability when called from a background thread.
     """
     sources: list[str] = []
 
@@ -343,11 +379,14 @@ def probe_ndi_sources(timeout_s: float = 5.0) -> list[str]:
 
         provider = factory.get()
         provider.start()
-        time.sleep(timeout_s)
+
+        _pump_glib_for(timeout_s)
+
         for device in provider.get_devices():
             name = device.get_display_name()
             if name:
                 sources.append(name)
+
         provider.stop()
     except Exception as exc:
         log.warning("probe_error", exc=str(exc))
@@ -591,7 +630,7 @@ class NdiToWhipBridge:
             self.cfg.ndi_source_name = old_source
             self.cfg.ndi_connect_timeout_ms = old_timeout
 
-    def _start_primary_poll(self, primary: str, poll_interval_s: float = 20.0) -> threading.Thread:
+    def _start_primary_poll(self, primary: str, poll_interval_s: float = 2.0) -> threading.Thread:
         """
         Start a background thread that polls for `primary` every `poll_interval_s`.
         When a usable primary is detected (verified by `_try_establish_source`),
@@ -615,9 +654,9 @@ class NdiToWhipBridge:
                         continue
 
                 try:
-                    log.debug("begin_probe", primary=primary    )
+                    log.debug("begin_probe", primary=primary)
                     # Quick probe to avoid expensive connect attempts
-                    sources = probe_ndi_sources(timeout_s=15.0)
+                    sources = probe_ndi_sources(timeout_s=2.0)
                     log.debug("probe_results", sources=sources)
                     if primary in sources:
                         log.info("primary_seen", primary=primary)
@@ -736,7 +775,7 @@ class NdiToWhipBridge:
             if backup and not self._stop_event.is_set():
                 log.info("using_backup", backup=backup)
                 self.cfg.ndi_source_name = backup
-                poll_thread = self._start_primary_poll(primary, poll_interval_s=10.0)
+                poll_thread = self._start_primary_poll(primary, poll_interval_s=2.0)
                 try:
                     try:
                         self._run_once()
@@ -872,7 +911,7 @@ def main() -> None:
     level = getattr(logging, cfg.log_level.upper(), logging.INFO)
     logging.getLogger().setLevel(level)
 
-    # ── Modes ──────────────────────────────────────────────────────────────────
+    # ── Modes ─────────────────────────────────────────────────────────────────
 
     if args.validate:
         print("Validating required GStreamer elements:")
@@ -895,7 +934,7 @@ def main() -> None:
         print(build_pipeline_string(cfg))
         sys.exit(0)
 
-    # ── Streaming mode ─────────────────────────────────────────────────────────
+    # ── Streaming mode ────────────────────────────────────────────────────────
 
     bridge = NdiToWhipBridge(cfg)
 
