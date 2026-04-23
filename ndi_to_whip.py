@@ -535,6 +535,12 @@ class NdiToWhipBridge:
         # Set by the background poller to tell the GLib watchdog (and run())
         # that a better source has appeared and the pipeline should restart.
         self._source_switch_requested = threading.Event()
+        # Tracks the source name that ended on failure (not a poller-triggered
+        # switch).  Used as a one-cycle exclusion so a dead source that is
+        # still cached by the NDI device provider doesn't get re-selected
+        # immediately — allowing failover to backup without a round-trip.
+        # Reset to None once the exclusion has been applied.
+        self._last_failed_source: Optional[str] = None
 
     # ── Pipeline construction ─────────────────────────────────────────────────
 
@@ -872,17 +878,31 @@ class NdiToWhipBridge:
                         self._visible_sources = set(initial)
                     visible = set(initial)
 
-                # Pick the best source: primary if visible, backup otherwise.
-                if primary in visible:
+                # Pick the best source: primary if visible AND it didn't just
+                # fail this cycle (NDI device provider caches dead sources for
+                # up to ~30 s, so we must exclude them explicitly).
+                primary_excluded = (self._last_failed_source == primary)
+                self._last_failed_source = None  # consume the one-cycle exclusion
+
+                if primary in visible and not primary_excluded:
                     self.cfg.ndi_source_name = primary
                     log.info("source_selected", source=primary, reason="primary_visible")
                 elif backup:
                     self.cfg.ndi_source_name = backup
-                    reason = "backup_in_visible" if backup in visible else "primary_absent_trying_backup"
+                    if primary_excluded:
+                        reason = "primary_just_failed_using_backup"
+                    elif backup in visible:
+                        reason = "primary_absent_backup_visible"
+                    else:
+                        reason = "primary_absent_trying_backup"
                     log.info("source_selected", source=backup, reason=reason)
                 else:
                     self.cfg.ndi_source_name = primary
                     log.info("source_selected", source=primary, reason="no_backup_configured")
+
+                # Remember which source we are about to attempt so we can
+                # record a failure against it after _run_once() returns.
+                attempted_source = self.cfg.ndi_source_name
 
                 # Run the pipeline for the chosen source.
                 try:
@@ -898,13 +918,24 @@ class NdiToWhipBridge:
                     self._stop_event.set()
                     break
 
-                # If the poller detected a better source mid-stream, skip the
-                # backoff delay so the switch is near-instant.
+                # If the poller triggered a switch, don't record a failure —
+                # the pipeline ended intentionally.  Skip backoff immediately.
                 if self._source_switch_requested.is_set():
                     log.info("immediate_retry", next_source=self.cfg.ndi_source_name)
                     continue
 
-                # Ordinary failure — exponential backoff before retrying.
+                # Pipeline ended unexpectedly.  Record the failure so the next
+                # cycle excludes this source and tries the other one.
+                self._last_failed_source = attempted_source
+                log.info("source_failed", source=attempted_source)
+
+                # If the source that just failed is primary and backup is
+                # configured, switch to backup immediately without backoff.
+                if attempted_source == primary and backup:
+                    log.info("failover_to_backup", backup=backup)
+                    continue
+
+                # Ordinary failure (backup died, or no backup) — backoff.
                 delay = self._reconnect_delay()
                 log.info("reconnect_waiting", delay_s=round(delay, 1), attempt=self._attempt)
                 self._stop_event.wait(timeout=delay)
