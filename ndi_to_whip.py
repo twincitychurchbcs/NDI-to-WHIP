@@ -529,8 +529,11 @@ class NdiToWhipBridge:
         self._stop_event   = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
         self._attempt      = 0
-        # Set by the primary poller when it triggers a source switch so the
-        # main run() loop can skip the backoff delay and retry immediately.
+        # Continuously updated by the background poller.
+        self._visible_sources: set[str]       = set()
+        self._sources_lock                    = threading.Lock()
+        # Set by the background poller to tell the GLib watchdog (and run())
+        # that a better source has appeared and the pipeline should restart.
         self._source_switch_requested = threading.Event()
 
     # ── Pipeline construction ─────────────────────────────────────────────────
@@ -718,59 +721,53 @@ class NdiToWhipBridge:
             self.cfg.ndi_source_name = old_source
             self.cfg.ndi_connect_timeout_ms = old_timeout
 
-    def _start_primary_poll(
-        self, primary: str, poll_interval_s: float = 20.0
+    def _start_background_poller(
+        self, primary: str, poll_interval_s: float = 10.0
     ) -> tuple[threading.Thread, threading.Event]:
         """
-        Start a background thread that polls for `primary` every `poll_interval_s`.
-        When the primary NDI source is visible it sets `_source_switch_requested`,
-        updates `cfg.ndi_source_name`, and calls `_schedule_reconnect()` so the
-        main loop will restart the pipeline on the primary source immediately.
+        Start a persistent background thread that runs for the full lifetime of
+        the bridge.  Every ``poll_interval_s`` seconds it probes the network,
+        updates ``_visible_sources``, and — when the bridge is streaming the
+        backup source and the primary source appears — sets
+        ``_source_switch_requested`` so the GLib watchdog can quit the current
+        pipeline and trigger a switch back to primary.
 
-        Returns ``(thread, poller_stop_event)``.  The caller should call
-        ``poller_stop_event.set()`` before ``thread.join()`` to wake and clean up
-        the poller without waiting for the full poll interval.
+        Polling never stops while the bridge is running; it is independent of
+        which source is currently active.  Returns ``(thread, poller_stop_event)``;
+        call ``poller_stop_event.set()`` to shut it down cleanly.
         """
-        stop_evt = self._stop_event
-        # Per-poller stop event so the finally block can wake the thread promptly
-        # without flagging the entire bridge for shutdown.
+        stop_evt   = self._stop_event
         poller_stop = threading.Event()
 
-        def _poller():
-            log.info("primary_poller_started", primary=primary, interval_s=poll_interval_s)
+        def _poller() -> None:
+            log.info("background_poller_started", primary=primary, interval_s=poll_interval_s)
             while not stop_evt.is_set() and not poller_stop.is_set():
-                # Wait until an active pipeline exists before probing so that we
-                # don't fire at startup before _run_once() has created one.
-                if not self.pipeline:
-                    poller_stop.wait(timeout=0.1)
-                    if not self.pipeline:
-                        continue
-
                 try:
-                    log.debug("begin_probe", primary=primary)
-                    sources = probe_ndi_sources(timeout_s=15.0)
-                    log.debug("probe_results", sources=sources)
-                    if primary in sources:
-                        log.info("primary_seen_switching", primary=primary)
-                        # Signal the main thread to switch sources.
-                        # The GLib watchdog timer in _run_glib_loop will detect
-                        # _source_switch_requested and call loop.quit() from
-                        # within the GLib thread — avoiding the race where we
-                        # called _schedule_reconnect() here before self.loop
-                        # was assigned, or while the GLib thread was mid-dispatch.
+                    sources = probe_ndi_sources(timeout_s=5.0)
+                    with self._sources_lock:
+                        self._visible_sources = set(sources)
+                    log.debug("sources_updated", visible=sorted(sources))
+
+                    # Trigger a switch to primary only when we are currently
+                    # streaming a different source (backup) and primary has
+                    # appeared on the network.  Do NOT fire when already on
+                    # primary — let the pipeline handle its own failures.
+                    if (
+                        primary in sources
+                        and self.cfg.ndi_source_name != primary
+                        and not self._source_switch_requested.is_set()
+                    ):
+                        log.info("primary_appeared_switching", primary=primary)
                         self.cfg.ndi_source_name = primary
                         self._source_switch_requested.set()
-                        # Poller's job is done.  run() will create a fresh
-                        # poller the next time backup is needed.
-                        break
-                except Exception as exc:
-                    log.warning("primary_poller_error", exc=str(exc))
 
-                log.debug("end_probe")
-                # Interruptible sleep — woken early by poller_stop.set()
+                except Exception as exc:
+                    log.warning("background_poller_error", exc=str(exc))
+
+                # Interruptible sleep — woken immediately by poller_stop.set()
                 poller_stop.wait(timeout=poll_interval_s)
 
-            log.info("primary_poller_exiting", primary=primary)
+            log.info("background_poller_stopped")
 
         t = threading.Thread(target=_poller, daemon=True)
         t.start()
@@ -812,27 +809,20 @@ class NdiToWhipBridge:
     def run(self) -> None:
         """Run the bridge with retry/reconnect until stopped.
 
-        Outer loop structure
-        ────────────────────
-        Each cycle of the outer ``while`` loop represents one attempt to run
-        *some* source.  The cycle is:
+        A single background poller runs for the full bridge lifetime, keeping
+        ``_visible_sources`` up to date every 10 s.  The main loop picks the
+        best available source each cycle:
 
-        1. Probe for the primary source (2 s).
-        2. If primary is visible → try to stream primary (``_run_once``).
-           When primary dies, fall through to backup mode for this cycle.
-        3. If backup is configured → enter backup mode:
-               a. Start ONE persistent poller for the entire backup phase.
-               b. Inner loop: stream backup, restarting it whenever it dies,
-                  until either the global stop is requested or
-                  ``_source_switch_requested`` is set by the poller.
-               c. Stop the poller (``poller_stop.set()``).
-        4. If the poller flagged a switch → ``continue`` (immediate next cycle,
-           which will probe and find primary available).
-        5. Otherwise → exponential backoff, then next cycle.
+        * Primary visible → stream primary.
+        * Primary not visible, backup configured → stream backup.
+        * Neither visible → exponential backoff, retry.
 
-        The poller is intentionally decoupled from individual backup
-        ``_run_once()`` calls: it lives for the whole backup phase so that
-        backup failures and restarts do not kill and recreate the poller.
+        When the poller detects that primary has reappeared while we are
+        streaming backup, it sets ``cfg.ndi_source_name = primary`` and
+        ``_source_switch_requested``.  The GLib watchdog (in
+        ``_run_glib_loop``) detects this flag within 500 ms and quits the
+        pipeline cleanly from within the GLib thread.  The main loop then
+        skips backoff and immediately retries, streaming primary.
         """
         log.info(
             "bridge_starting",
@@ -855,106 +845,76 @@ class NdiToWhipBridge:
 
         log.info("ndi_sources", primary=primary, backup=backup)
 
-        def _max_reached() -> bool:
-            if max_attempts and self._attempt >= max_attempts:
-                log.error("retry_limit_reached", attempts=self._attempt)
-                self._stop_event.set()
-                return True
-            return False
+        # Start the persistent background poller once for the full lifetime of
+        # the bridge.  It updates _visible_sources every 10 s regardless of
+        # which source is currently active, and signals when primary returns.
+        poll_thread, poller_stop = self._start_background_poller(
+            primary, poll_interval_s=10.0
+        )
 
-        while not self._stop_event.is_set():
-            # Clear any stale switch flag from a previous cycle so it cannot
-            # accidentally skip the next backoff or re-trigger a switch.
-            self._source_switch_requested.clear()
+        try:
+            while not self._stop_event.is_set():
+                # Clear stale switch flag at the top of every cycle.
+                self._source_switch_requested.clear()
 
-            # ── 1. Probe for primary ──────────────────────────────────────
-            try:
-                sources = probe_ndi_sources(timeout_s=2.0)
-            except Exception:
-                sources = [primary]       # probe failed — assume primary there
+                # Use the latest source list from the background poller.
+                # On the very first cycle it may be empty — seed it with a
+                # quick synchronous probe so we don't blindly try backup.
+                with self._sources_lock:
+                    visible = set(self._visible_sources)
 
-            # ── 2. Try primary if visible ─────────────────────────────────
-            if primary in sources:
-                log.info("primary_available", primary=primary)
-                self.cfg.ndi_source_name = primary
+                if not visible:
+                    try:
+                        initial = probe_ndi_sources(timeout_s=2.0)
+                    except Exception:
+                        initial = []
+                    with self._sources_lock:
+                        self._visible_sources = set(initial)
+                    visible = set(initial)
+
+                # Pick the best source: primary if visible, backup otherwise.
+                if primary in visible:
+                    self.cfg.ndi_source_name = primary
+                    log.info("source_selected", source=primary, reason="primary_visible")
+                elif backup:
+                    self.cfg.ndi_source_name = backup
+                    reason = "backup_in_visible" if backup in visible else "primary_absent_trying_backup"
+                    log.info("source_selected", source=backup, reason=reason)
+                else:
+                    self.cfg.ndi_source_name = primary
+                    log.info("source_selected", source=primary, reason="no_backup_configured")
+
+                # Run the pipeline for the chosen source.
                 try:
                     self._run_once()
                 except Exception as exc:
                     log.exception("pipeline_exception", exc=str(exc))
 
-                if self._stop_event.is_set() or _max_reached():
+                if self._stop_event.is_set():
                     break
 
-                # Primary died.  If backup is configured, enter backup mode
-                # immediately (don't re-probe — the dead source may still be
-                # cached in the NDI device list for tens of seconds).
-                if not backup:
-                    # No backup → delay and retry primary.
-                    delay = self._reconnect_delay()
-                    log.info("reconnect_waiting", delay_s=round(delay, 1))
-                    self._stop_event.wait(timeout=delay)
-                    continue
-
-            if self._stop_event.is_set():
-                break
-
-            # ── 3. Backup mode ────────────────────────────────────────────
-            if backup:
-                # Start ONE persistent poller that watches for primary
-                # throughout the entire backup phase.  It is NOT restarted on
-                # each individual backup pipeline failure; it runs until either
-                # it finds primary or the bridge is stopped.
-                poll_thread, poller_stop = self._start_primary_poll(
-                    primary, poll_interval_s=10.0
-                )
-                try:
-                    # Inner loop: keep backup streaming; restart on failure.
-                    while (
-                        not self._stop_event.is_set()
-                        and not self._source_switch_requested.is_set()
-                    ):
-                        log.info("using_backup", backup=backup)
-                        self.cfg.ndi_source_name = backup
-                        try:
-                            self._run_once()
-                        except Exception as exc:
-                            log.exception("pipeline_exception", exc=str(exc))
-
-                        if self._stop_event.is_set() or _max_reached():
-                            break
-
-                        if self._source_switch_requested.is_set():
-                            break
-
-                        # Backup died without primary appearing; brief fixed
-                        # delay before restarting backup (not exponential —
-                        # the outer backoff handles the "nothing works" case).
-                        self._stop_event.wait(timeout=self.cfg.retry_initial_delay_s)
-                finally:
-                    # Stop the poller no matter how the inner loop exits.
-                    poller_stop.set()
-                    try:
-                        poll_thread.join(timeout=2.0)
-                    except Exception:
-                        pass
-
-                if self._stop_event.is_set() or _max_reached():
+                if max_attempts and self._attempt >= max_attempts:
+                    log.error("retry_limit_reached", attempts=self._attempt)
+                    self._stop_event.set()
                     break
 
+                # If the poller detected a better source mid-stream, skip the
+                # backoff delay so the switch is near-instant.
                 if self._source_switch_requested.is_set():
-                    # Poller detected primary — go straight to the top of the
-                    # outer loop (where we will probe + stream primary).
-                    # _source_switch_requested will be cleared there.
-                    log.info("switching_to_primary", primary=primary)
+                    log.info("immediate_retry", next_source=self.cfg.ndi_source_name)
                     continue
 
-            # ── 4. Nothing worked this cycle — exponential backoff ────────
-            if self._stop_event.is_set() or _max_reached():
-                break
+                # Ordinary failure — exponential backoff before retrying.
+                delay = self._reconnect_delay()
+                log.info("reconnect_waiting", delay_s=round(delay, 1), attempt=self._attempt)
+                self._stop_event.wait(timeout=delay)
 
-            delay = self._reconnect_delay()
-            log.info("reconnect_waiting", delay_s=round(delay, 1), attempt=self._attempt)
-            self._stop_event.wait(timeout=delay)
+        finally:
+            poller_stop.set()
+            try:
+                poll_thread.join(timeout=2.0)
+            except Exception:
+                pass
 
         log.info("bridge_stopped")
 
