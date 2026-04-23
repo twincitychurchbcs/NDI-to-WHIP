@@ -649,6 +649,28 @@ class NdiToWhipBridge:
 
     def _run_glib_loop(self) -> None:
         self.loop = GLib.MainLoop()
+
+        # Capture these here so the closure doesn't hold a strong ref to self
+        # (avoids keeping the bridge alive beyond its useful life).
+        stop_evt   = self._stop_event
+        switch_evt = self._source_switch_requested
+        loop_ref   = self.loop
+
+        def _watchdog() -> bool:
+            """Called every 500 ms in the GLib thread.
+
+            Quits the main loop if a source-switch or global stop was
+            requested by another thread.  Doing the quit here (inside the
+            GLib thread) avoids the race where the poller thread called
+            loop.quit() before self.loop was even assigned.
+            """
+            if stop_evt.is_set() or switch_evt.is_set():
+                if loop_ref.is_running():
+                    loop_ref.quit()
+                return False   # remove this timer source
+            return True        # keep firing
+
+        GLib.timeout_add(500, _watchdog)
         self.loop.run()
 
     def _try_establish_source(self, src: str, attempt_timeout_s: float = 5.0) -> bool:
@@ -730,13 +752,14 @@ class NdiToWhipBridge:
                     log.debug("probe_results", sources=sources)
                     if primary in sources:
                         log.info("primary_seen_switching", primary=primary)
-                        # NDI source is visible — request an immediate switch.
-                        # We do NOT call _try_establish_source here because
-                        # that would create a competing WHIP pipeline while the
-                        # backup stream is live, disrupting the current session.
+                        # Signal the main thread to switch sources.
+                        # The GLib watchdog timer in _run_glib_loop will detect
+                        # _source_switch_requested and call loop.quit() from
+                        # within the GLib thread — avoiding the race where we
+                        # called _schedule_reconnect() here before self.loop
+                        # was assigned, or while the GLib thread was mid-dispatch.
                         self.cfg.ndi_source_name = primary
                         self._source_switch_requested.set()
-                        self._schedule_reconnect()
                         # Poller's job is done.  run() will create a fresh
                         # poller the next time backup is needed.
                         break
