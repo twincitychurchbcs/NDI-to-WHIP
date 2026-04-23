@@ -337,10 +337,14 @@ def _pump_glib_for(timeout_s: float, ctx: Optional[GLib.MainContext] = None) -> 
 
     If `ctx` is provided, we pump that context; otherwise we create a private
     context.
+
+    Implementation note:
+      Avoid relying on GLib.timeout_add(..., context=ctx) because some GI
+      bindings/builds may ignore the context kwarg; that can cause the loop to
+      never receive the timeout and hang indefinitely.
     """
     timeout_ms = max(0, int(timeout_s * 1000))
 
-    # Use a private context unless caller supplies one.
     ctx = ctx or GLib.MainContext.new()
     loop = GLib.MainLoop.new(ctx, False)
 
@@ -349,15 +353,31 @@ def _pump_glib_for(timeout_s: float, ctx: Optional[GLib.MainContext] = None) -> 
             loop.quit()
         except Exception:
             pass
-        return False  # do not repeat
+        return False
 
-    GLib.timeout_add(timeout_ms, _quit, context=ctx)
+    def _install_timeout() -> None:
+        # Install the timeout while running on the desired context.
+        try:
+            GLib.timeout_add(timeout_ms, _quit)
+        except Exception:
+            # Worst-case fallback: quit soon-ish.
+            try:
+                GLib.timeout_add(0, _quit)
+            except Exception:
+                pass
+
+    # Ensure the timeout source is attached to `ctx` by scheduling the
+    # installation via ctx.invoke (runs in this context).
+    try:
+        # priority default is fine
+        ctx.invoke_full(GLib.PRIORITY_DEFAULT, _install_timeout)
+    except Exception:
+        # Fallback: try installing directly (may attach to default context)
+        _install_timeout()
 
     try:
         loop.run()
     except Exception:
-        # If the loop fails for any reason, just return; probe will still try to
-        # read whatever devices are available.
         return
 
 
