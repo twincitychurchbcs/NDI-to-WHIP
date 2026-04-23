@@ -730,7 +730,22 @@ class NdiToWhipBridge:
                             # Request switching to primary
                             self.cfg.ndi_source_name = primary
                             self._schedule_reconnect()
-                            break
+                            # Don't exit the poller thread — keep monitoring.
+                            # Wait for the main thread to tear down the old
+                            # pipeline and create a new one for the primary
+                            # before continuing probes. This avoids the
+                            # poller terminating after a single switch.
+                            try:
+                                # Wait until pipeline is recreated (or stop requested)
+                                while not stop_evt.is_set():
+                                    if self.pipeline:
+                                        break
+                                    stop_evt.wait(timeout=0.2)
+                            except Exception:
+                                pass
+                            # Continue polling after a short grace period
+                            stop_evt.wait(timeout=0.5)
+                            continue
                         else:
                             log.info("primary_verify_failed", primary=primary)
                 except Exception as exc:
