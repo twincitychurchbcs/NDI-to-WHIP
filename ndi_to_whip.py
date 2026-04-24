@@ -728,25 +728,33 @@ class NdiToWhipBridge:
             self.cfg.ndi_connect_timeout_ms = old_timeout
 
     def _start_background_poller(
-        self, primary: str, poll_interval_s: float = 10.0
+        self, primary: str, backup: Optional[str] = None, poll_interval_s: float = 10.0
     ) -> tuple[threading.Thread, threading.Event]:
         """
-        Start a persistent background thread that runs for the full lifetime of
-        the bridge.  Every ``poll_interval_s`` seconds it probes the network,
-        updates ``_visible_sources``, and — when the bridge is streaming the
-        backup source and the primary source appears — sets
-        ``_source_switch_requested`` so the GLib watchdog can quit the current
-        pipeline and trigger a switch back to primary.
+        Start a persistent background thread that runs for the full bridge
+        lifetime.  Every ``poll_interval_s`` seconds it probes the network,
+        updates ``_visible_sources``, and fires ``_source_switch_requested``
+        (which the GLib watchdog converts into a clean pipeline quit) for two
+        transitions:
 
-        Polling never stops while the bridge is running; it is independent of
-        which source is currently active.  Returns ``(thread, poller_stop_event)``;
-        call ``poller_stop_event.set()`` to shut it down cleanly.
+        * backup  → primary : primary reappears while we are streaming backup.
+        * primary → backup  : primary disappears while we are streaming primary
+                              AND backup is configured.  This handles the case
+                              where ndisrc retries silently instead of emitting
+                              a GStreamer error, keeping ``_run_once()`` alive
+                              indefinitely.
+
+        Returns ``(thread, poller_stop_event)``; call
+        ``poller_stop_event.set()`` to shut it down cleanly.
         """
-        stop_evt   = self._stop_event
+        stop_evt    = self._stop_event
         poller_stop = threading.Event()
 
         def _poller() -> None:
-            log.info("background_poller_started", primary=primary, interval_s=poll_interval_s)
+            log.info(
+                "background_poller_started",
+                primary=primary, backup=backup, interval_s=poll_interval_s,
+            )
             while not stop_evt.is_set() and not poller_stop.is_set():
                 try:
                     sources = probe_ndi_sources(timeout_s=5.0)
@@ -754,18 +762,31 @@ class NdiToWhipBridge:
                         self._visible_sources = set(sources)
                     log.debug("sources_updated", visible=sorted(sources))
 
-                    # Trigger a switch to primary only when we are currently
-                    # streaming a different source (backup) and primary has
-                    # appeared on the network.  Do NOT fire when already on
-                    # primary — let the pipeline handle its own failures.
-                    if (
-                        primary in sources
-                        and self.cfg.ndi_source_name != primary
-                        and not self._source_switch_requested.is_set()
-                    ):
-                        log.info("primary_appeared_switching", primary=primary)
-                        self.cfg.ndi_source_name = primary
-                        self._source_switch_requested.set()
+                    current = self.cfg.ndi_source_name
+
+                    if not self._source_switch_requested.is_set():
+                        # backup → primary: primary came back while on backup.
+                        if primary in sources and current != primary:
+                            log.info("primary_appeared_switching", primary=primary)
+                            self.cfg.ndi_source_name = primary
+                            self._source_switch_requested.set()
+
+                        # primary → backup: primary gone while on primary.
+                        # ndisrc may retry silently (no GStreamer error) so the
+                        # pipeline would hang indefinitely without this check.
+                        elif (
+                            primary not in sources
+                            and current == primary
+                            and backup is not None
+                        ):
+                            log.info(
+                                "primary_gone_switching_to_backup",
+                                primary=primary, backup=backup,
+                            )
+                            # Do NOT set cfg.ndi_source_name here — let run()
+                            # re-evaluate via _visible_sources in the next cycle
+                            # (primary will be absent, so backup is picked).
+                            self._source_switch_requested.set()
 
                 except Exception as exc:
                     log.warning("background_poller_error", exc=str(exc))
@@ -853,9 +874,10 @@ class NdiToWhipBridge:
 
         # Start the persistent background poller once for the full lifetime of
         # the bridge.  It updates _visible_sources every 10 s regardless of
-        # which source is currently active, and signals when primary returns.
+        # which source is active, and signals switches in both directions:
+        # backup→primary (primary reappears) and primary→backup (primary gone).
         poll_thread, poller_stop = self._start_background_poller(
-            primary, poll_interval_s=10.0
+            primary, backup=backup, poll_interval_s=10.0
         )
 
         try:
