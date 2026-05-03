@@ -306,32 +306,36 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
             start-bitrate={video_bps}
             min-bitrate={video_bps}
             max-bitrate={video_bps}
-            async-handling=true
+            latency=50
+            sync=true
+            async=false
 
         ndisrc name=ndi_src
             ndi-name="{cfg.ndi_source_name}"
             connect-timeout={cfg.ndi_connect_timeout_ms}
+            do-timestamp=true
         ! ndisrcdemux name=demux
 
         {demux_video_pad}
-        ! queue name=vqueue
-            leaky=downstream
-            max-size-buffers=5
-            max-size-time=200000000
+        ! queue
+            max-size-buffers=3
+            max-size-time=50000000
             max-size-bytes=0
+            leaky=downstream
         ! videoconvert
         ! {video_caps}
+        ! identity sync=true
         ! whip.
 
         {demux_audio_pad}
-        ! queue name=aqueue
-            leaky=downstream
-            max-size-buffers=10
-            max-size-time=200000000
+        ! queue
+            max-size-buffers=3
+            max-size-time=50000000
             max-size-bytes=0
+            leaky=downstream
         ! audioconvert
-        ! audioresample quality=0
-        {adelay_str}
+        ! audioresample
+        ! identity sync=true
         ! {audio_caps}
         ! whip.
     """
