@@ -882,19 +882,58 @@ class NdiToWhipBridge:
                         return True
                     samples = list(self._av_samples)
                     med = statistics.median(samples)
-                    # If median < -2 ms then audio leads video: delay audio by -med
+
+                    # Clamp to sensible range
+                    if med < -2000.0:
+                        med = -2000.0
+                    if med > 2000.0:
+                        med = 2000.0
+
+                    # Negative median: audio leads → delay audio via adelay
                     if med < -2.0:
-                        desired_ms = int(min(max(0, -med), 2000))
+                        desired_audio_ms = int(min(max(0, -med), 2000))
                     else:
-                        desired_ms = 0
-                    adel = self.pipeline.get_by_name("adel") if self.pipeline else None
-                    if adel is not None:
-                        try:
-                            # `adelay.delay` expects milliseconds
-                            adel.set_property("delay", desired_ms)
-                            log.debug("adelay_set", delay_ms=desired_ms)
-                        except Exception:
-                            log.debug("adelay_set_failed")
+                        desired_audio_ms = 0
+
+                    # Positive median: audio lags → delay video by buffering in vqueue
+                    if med > 2.0:
+                        desired_video_ms = int(min(max(0, med), 2000))
+                    else:
+                        desired_video_ms = 0
+
+                    # Apply audio delay if adelay present
+                    try:
+                        adel = self.pipeline.get_by_name("adel") if self.pipeline else None
+                        if adel is not None:
+                            adel.set_property("delay", desired_audio_ms)
+                            log.debug("adelay_set", delay_ms=desired_audio_ms)
+                    except Exception:
+                        log.debug("adelay_set_failed")
+
+                    # Apply video buffering by setting vqueue min/max time
+                    try:
+                        vq = self.pipeline.get_by_name("vqueue") if self.pipeline else None
+                        if vq is not None and desired_video_ms > 0:
+                            desired_ns = int(desired_video_ms * (Gst.SECOND / 1000))
+                            # min-threshold-time tells the queue to hold until this
+                            # much data is buffered; max-size-time caps storage.
+                            try:
+                                vq.set_property("min-threshold-time", desired_ns)
+                                vq.set_property("max-size-time", desired_ns * 2)
+                                log.debug("vqueue_delay_set", delay_ms=desired_video_ms)
+                            except Exception:
+                                log.debug("vqueue_set_failed")
+                        elif vq is not None and desired_video_ms == 0:
+                            # Clear any previously set thresholds
+                            try:
+                                vq.set_property("min-threshold-time", 0)
+                                vq.set_property("max-size-time", 200000000)
+                                log.debug("vqueue_delay_cleared")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
                 except Exception:
                     pass
                 return True
