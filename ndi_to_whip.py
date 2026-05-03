@@ -321,8 +321,6 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
             max-size-time=200000000
             max-size-bytes=0
         ! videoconvert
-        ! videoscale
-        ! videorate
         ! {video_caps}
         ! whip.
 
@@ -1095,7 +1093,7 @@ def validate_elements() -> bool:
     required = [
         "ndisrc", "ndisrcdemux",
         "whipclientsink",
-        "videoconvert", "videoscale", "videorate",
+        "videoconvert",
         "x264enc", "opusenc",
         "rtph264pay", "rtpopuspay",
         "audioconvert", "audioresample",
