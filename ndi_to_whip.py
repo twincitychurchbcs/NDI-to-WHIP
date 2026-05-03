@@ -815,6 +815,48 @@ class NdiToWhipBridge:
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
 
+        # Install simple pad probes to measure A/V timestamp offset for
+        # runtime diagnostics. Logs `av_sync_offset_ms` when both streams
+        # produce buffers.
+        def _maybe_log_av_offset():
+            try:
+                v = getattr(self, "_last_video_pts", None)
+                a = getattr(self, "_last_audio_pts", None)
+                if v is None or a is None:
+                    return
+                # Convert nanoseconds to milliseconds
+                offset_ms = (int(a) - int(v)) / (Gst.SECOND / 1000)
+                log.info("av_sync_offset_ms", offset_ms=round(offset_ms, 1))
+            except Exception:
+                pass
+
+        def _make_probe(attr_name):
+            def _probe(pad, info):
+                buf = info.get_buffer()
+                if buf is None:
+                    return Gst.PadProbeReturn.OK
+                pts = buf.pts
+                if pts == Gst.CLOCK_TIME_NONE:
+                    return Gst.PadProbeReturn.OK
+                setattr(self, attr_name, pts)
+                _maybe_log_av_offset()
+                return Gst.PadProbeReturn.OK
+            return _probe
+
+        try:
+            vqueue = self.pipeline.get_by_name("vqueue")
+            if vqueue is not None:
+                vpad = vqueue.get_static_pad("src")
+                if vpad:
+                    vpad.add_probe(Gst.PadProbeType.BUFFER, _make_probe("_last_video_pts"))
+            aqueue = self.pipeline.get_by_name("aqueue")
+            if aqueue is not None:
+                apad = aqueue.get_static_pad("src")
+                if apad:
+                    apad.add_probe(Gst.PadProbeType.BUFFER, _make_probe("_last_audio_pts"))
+        except Exception:
+            log.debug("av_probe_setup_failed")
+
         # Start GLib loop in background thread
         self._loop_thread = threading.Thread(target=self._run_glib_loop, daemon=True)
         self._loop_thread.start()
