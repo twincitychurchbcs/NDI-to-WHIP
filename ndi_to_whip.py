@@ -311,7 +311,6 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
         ndisrc name=ndi_src
             ndi-name="{cfg.ndi_source_name}"
             connect-timeout={cfg.ndi_connect_timeout_ms}
-            do-timestamp=true
         ! ndisrcdemux name=demux
 
         {demux_video_pad}
@@ -331,7 +330,7 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
             max-size-time=200000000
             max-size-bytes=0
         ! audioconvert
-        ! audioresample
+        ! audioresample quality=0
         {adelay_str}
         ! {audio_caps}
         ! whip.
@@ -879,6 +878,22 @@ class NdiToWhipBridge:
             log.debug("av_probe_setup_failed")
 
         self._av_samples = deque(maxlen=60)
+
+        # Apply static audio offset via GstPad.set_offset() on the aqueue src
+        # pad. A NEGATIVE offset advances audio timestamps (audio plays earlier
+        # = reduces lag). A POSITIVE offset delays audio. Configured via
+        # audio_offset_ms in config.toml or --audio-offset on the CLI.
+        if self.cfg.audio_offset_ms != 0:
+            try:
+                aqueue = self.pipeline.get_by_name("aqueue")
+                if aqueue is not None:
+                    apad = aqueue.get_static_pad("src")
+                    if apad is not None:
+                        offset_ns = int(self.cfg.audio_offset_ms * (Gst.SECOND / 1000))
+                        apad.set_offset(-offset_ns)  # negative = advance audio
+                        log.info("audio_pad_offset_set", offset_ms=self.cfg.audio_offset_ms)
+            except Exception as exc:
+                log.warning("audio_pad_offset_failed", exc=str(exc))
 
         # Start GLib loop in background thread
         self._loop_thread = threading.Thread(target=self._run_glib_loop, daemon=True)
