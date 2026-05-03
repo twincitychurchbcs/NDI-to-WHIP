@@ -305,19 +305,19 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
         ! videoscale
         ! videorate
         ! {video_caps}
-        ! identity sync=true single-segment=true
+        ! identity sync=true
         ! whip.
 
         {demux_audio_pad}
         ! queue name=aqueue
             leaky=downstream
-            max-size-buffers=3
+            max-size-buffers=10
             max-size-time=200000000
             max-size-bytes=0
         ! audioconvert
         ! audioresample
         ! {audio_caps}
-        ! identity sync=true single-segment=true
+        ! identity sync=true
         ! whip.
     """
 
