@@ -305,6 +305,7 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
         ! videoscale
         ! videorate
         ! {video_caps}
+        ! identity sync=true single-segment=true
         ! whip.
 
         {demux_audio_pad}
@@ -316,6 +317,7 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
         ! audioconvert
         ! audioresample
         ! {audio_caps}
+        ! identity sync=true single-segment=true
         ! whip.
     """
 
@@ -1027,7 +1029,7 @@ def validate_elements() -> bool:
         "x264enc", "opusenc",
         "rtph264pay", "rtpopuspay",
         "audioconvert", "audioresample",
-        "queue",
+        "identity", "queue",
     ]
     all_ok = True
     for name in required:
