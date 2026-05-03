@@ -276,6 +276,13 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
     stun_prop = f'stun-server="{cfg.stun_server}"' if cfg.stun_server else ""
     turn_prop = f'turn-server="{cfg.turn_server}"' if cfg.turn_server else ""
 
+    # Optional adelay element: only include if the element is available
+    try:
+        _adelay_available = Gst.ElementFactory.find("adelay") is not None
+    except Exception:
+        _adelay_available = False
+    adelay_str = "! adelay name=adel delay=0" if _adelay_available else ""
+
     # Bitrate in bps for GstBaseWebRTCSink (config stores kbps for video)
     video_bps = cfg.video_bitrate_kbps * 1000
 
@@ -318,7 +325,7 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
             max-size-bytes=0
         ! audioconvert
         ! audioresample
-        ! adelay name=adel delay=0
+        {adelay_str}
         ! {audio_caps}
         ! identity sync=true
         ! whip.
@@ -1111,7 +1118,7 @@ def validate_elements() -> bool:
         "x264enc", "opusenc",
         "rtph264pay", "rtpopuspay",
         "audioconvert", "audioresample",
-        "identity", "queue", "adelay",
+        "identity", "queue",
     ]
     all_ok = True
     for name in required:
