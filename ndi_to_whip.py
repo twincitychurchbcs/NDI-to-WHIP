@@ -30,6 +30,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from collections import deque
+import statistics
 
 # ── Python 3.11+ has tomllib in stdlib; older Pythons need tomli ─────────────
 try:
@@ -316,6 +318,7 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
             max-size-bytes=0
         ! audioconvert
         ! audioresample
+        ! adelay name=adel delay=0
         ! {audio_caps}
         ! identity sync=true
         ! whip.
@@ -826,6 +829,11 @@ class NdiToWhipBridge:
                     return
                 # Convert nanoseconds to milliseconds
                 offset_ms = (int(a) - int(v)) / (Gst.SECOND / 1000)
+                # record sample for moving-median
+                try:
+                    self._av_samples.append(offset_ms)
+                except Exception:
+                    pass
                 log.info("av_sync_offset_ms", offset_ms=round(offset_ms, 1))
             except Exception:
                 pass
@@ -856,6 +864,38 @@ class NdiToWhipBridge:
                     apad.add_probe(Gst.PadProbeType.BUFFER, _make_probe("_last_audio_pts"))
         except Exception:
             log.debug("av_probe_setup_failed")
+
+        # Moving-median based audio-delay adjuster (runs in GLib mainloop)
+        try:
+            self._av_samples = deque(maxlen=60)
+
+            def _adjust_delay():
+                try:
+                    if not hasattr(self, "_av_samples") or not self._av_samples:
+                        return True
+                    samples = list(self._av_samples)
+                    med = statistics.median(samples)
+                    # If median < -2 ms then audio leads video: delay audio by -med
+                    if med < -2.0:
+                        desired_ms = int(min(max(0, -med), 2000))
+                    else:
+                        desired_ms = 0
+                    adel = self.pipeline.get_by_name("adel") if self.pipeline else None
+                    if adel is not None:
+                        try:
+                            # `adelay.delay` expects milliseconds
+                            adel.set_property("delay", desired_ms)
+                            log.debug("adelay_set", delay_ms=desired_ms)
+                        except Exception:
+                            log.debug("adelay_set_failed")
+                except Exception:
+                    pass
+                return True
+
+            # run every 500ms
+            GLib.timeout_add(500, _adjust_delay)
+        except Exception:
+            log.debug("av_delay_adjuster_failed")
 
         # Start GLib loop in background thread
         self._loop_thread = threading.Thread(target=self._run_glib_loop, daemon=True)
@@ -1071,7 +1111,7 @@ def validate_elements() -> bool:
         "x264enc", "opusenc",
         "rtph264pay", "rtpopuspay",
         "audioconvert", "audioresample",
-        "identity", "queue",
+        "identity", "queue", "adelay",
     ]
     all_ok = True
     for name in required:
