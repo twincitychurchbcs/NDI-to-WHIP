@@ -104,6 +104,7 @@ class Config:
     audio_channels: int           = 2
     audio_sample_rate: int        = 48000   # Hz
     audio_bitrate_bps: int        = 128000  # bps for Opus encoder
+    audio_offset_ms: int          = 0       # ms to delay audio (positive) or advance video (negative) for A/V sync
 
     # Retry / reconnect
     retry_max_attempts: int       = 0       # 0 = unlimited
@@ -171,6 +172,7 @@ def load_config(config_path: Optional[str], overrides: dict) -> Config:
                     "channels":     "audio_channels",
                     "sample_rate":  "audio_sample_rate",
                     "bitrate_bps":  "audio_bitrate_bps",
+                    "offset_ms":    "audio_offset_ms",
                 })
                 _apply("retry",  {
                     "max_attempts":    "retry_max_attempts",
@@ -276,12 +278,20 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
     stun_prop = f'stun-server="{cfg.stun_server}"' if cfg.stun_server else ""
     turn_prop = f'turn-server="{cfg.turn_server}"' if cfg.turn_server else ""
 
-    # Optional adelay element: only include if the element is available
+    # Optional adelay element for static A/V sync correction (positive offset_ms delays audio).
+    # Only include if the element is available on this system.
     try:
         _adelay_available = Gst.ElementFactory.find("adelay") is not None
     except Exception:
         _adelay_available = False
-    adelay_str = "! adelay name=adel delay=0" if _adelay_available else ""
+    _adelay_ms = max(0, cfg.audio_offset_ms)  # adelay only supports non-negative delay
+    adelay_str = f"! adelay name=adel delay={_adelay_ms}" if _adelay_available else ""
+    if not _adelay_available and cfg.audio_offset_ms != 0:
+        import warnings
+        warnings.warn(
+            f"audio_offset_ms={cfg.audio_offset_ms} set but 'adelay' element is not available; offset ignored.",
+            RuntimeWarning, stacklevel=2,
+        )
 
     # Bitrate in bps for GstBaseWebRTCSink (config stores kbps for video)
     video_bps = cfg.video_bitrate_kbps * 1000
@@ -314,7 +324,6 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
         ! videoscale
         ! videorate
         ! {video_caps}
-        ! identity sync=true
         ! whip.
 
         {demux_audio_pad}
@@ -327,7 +336,6 @@ def build_pipeline_string(cfg: Config, demux_video_pad: str = "demux.video",
         ! audioresample
         {adelay_str}
         ! {audio_caps}
-        ! identity sync=true
         ! whip.
     """
 
@@ -836,12 +844,12 @@ class NdiToWhipBridge:
                     return
                 # Convert nanoseconds to milliseconds
                 offset_ms = (int(a) - int(v)) / (Gst.SECOND / 1000)
-                # record sample for moving-median
+                # record sample for monitoring
                 try:
                     self._av_samples.append(offset_ms)
                 except Exception:
                     pass
-                log.info("av_sync_offset_ms", offset_ms=round(offset_ms, 1))
+                log.debug("av_sync_offset_ms", offset_ms=round(offset_ms, 1))
             except Exception:
                 pass
 
@@ -872,76 +880,7 @@ class NdiToWhipBridge:
         except Exception:
             log.debug("av_probe_setup_failed")
 
-        # Moving-median based audio-delay adjuster (runs in GLib mainloop)
-        try:
-            self._av_samples = deque(maxlen=60)
-
-            def _adjust_delay():
-                try:
-                    if not hasattr(self, "_av_samples") or not self._av_samples:
-                        return True
-                    samples = list(self._av_samples)
-                    med = statistics.median(samples)
-
-                    # Clamp to sensible range
-                    if med < -2000.0:
-                        med = -2000.0
-                    if med > 2000.0:
-                        med = 2000.0
-
-                    # Negative median: audio leads → delay audio via adelay
-                    if med < -2.0:
-                        desired_audio_ms = int(min(max(0, -med), 2000))
-                    else:
-                        desired_audio_ms = 0
-
-                    # Positive median: audio lags → delay video by buffering in vqueue
-                    if med > 2.0:
-                        desired_video_ms = int(min(max(0, med), 2000))
-                    else:
-                        desired_video_ms = 0
-
-                    # Apply audio delay if adelay present
-                    try:
-                        adel = self.pipeline.get_by_name("adel") if self.pipeline else None
-                        if adel is not None:
-                            adel.set_property("delay", desired_audio_ms)
-                            log.debug("adelay_set", delay_ms=desired_audio_ms)
-                    except Exception:
-                        log.debug("adelay_set_failed")
-
-                    # Apply video buffering by setting vqueue min/max time
-                    try:
-                        vq = self.pipeline.get_by_name("vqueue") if self.pipeline else None
-                        if vq is not None and desired_video_ms > 0:
-                            desired_ns = int(desired_video_ms * (Gst.SECOND / 1000))
-                            # min-threshold-time tells the queue to hold until this
-                            # much data is buffered; max-size-time caps storage.
-                            try:
-                                vq.set_property("min-threshold-time", desired_ns)
-                                vq.set_property("max-size-time", desired_ns * 2)
-                                log.debug("vqueue_delay_set", delay_ms=desired_video_ms)
-                            except Exception:
-                                log.debug("vqueue_set_failed")
-                        elif vq is not None and desired_video_ms == 0:
-                            # Clear any previously set thresholds
-                            try:
-                                vq.set_property("min-threshold-time", 0)
-                                vq.set_property("max-size-time", 200000000)
-                                log.debug("vqueue_delay_cleared")
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                except Exception:
-                    pass
-                return True
-
-            # run every 500ms
-            GLib.timeout_add(500, _adjust_delay)
-        except Exception:
-            log.debug("av_delay_adjuster_failed")
+        self._av_samples = deque(maxlen=60)
 
         # Start GLib loop in background thread
         self._loop_thread = threading.Thread(target=self._run_glib_loop, daemon=True)
@@ -1144,6 +1083,9 @@ def parse_args() -> argparse.Namespace:
                    dest="video_encoder")
     g.add_argument("--audio-bitrate",   type=int,        dest="audio_bitrate_bps",
                    metavar="BPS")
+    g.add_argument("--audio-offset",    type=int,        dest="audio_offset_ms",
+                   metavar="MS",
+                   help="Audio offset in ms: positive delays audio, negative not supported (no adelay back-fill)")
     g.add_argument("--log-level",       dest="log_level",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
